@@ -2,18 +2,20 @@ name: DiffusionEEG
 channels:
   - pytorch
   - nvidia
-  - conda-forge
   - defaults
 dependencies:
   - python=3.11
   - pytorch=2.2.2
-  - torchvision=0.17.2
-  - torchaudio=2.2.2
   - pytorch-cuda=12.1
+  - fsspec
+  - numpy=1.26.4
+  - mkl=2023.1.0
+  - intel-openmp=2023.1.0
   - einops
   - tensorboard
-  - pandas
-  - scikit-learn
-  - kaggle
   - matplotlib
   - tqdm
+  - scipy
+  - pip
+  - pip:
+      - mne==1.10.2
