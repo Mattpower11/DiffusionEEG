@@ -8,11 +8,15 @@ import torch.nn as nn
 from tqdm import tqdm
 from torch import optim
 from utils import *
-from modules.modules1D_cls_free import Unet1D_cls_free, GaussianDiffusion1D_cls_free
+from models.modules.modules1D_cls_free import Unet1D_cls_free, GaussianDiffusion1D_cls_free
 import logging
 from torch.utils.tensorboard import SummaryWriter
+from conf.cls_free_conf import cls_free_conf
+import argparse
 from MITBIH import *
 from torch.utils import data
+
+CFG = cls_free_conf()
 
 logging.basicConfig(format="%(asctime)s - %(levelname)s: %(message)s", level=logging.INFO, datefmt="%I:%M:%S")
 data_path = "./heartbeat/mitbih_train.csv"
@@ -42,7 +46,6 @@ def train(args):
     device = args.device
     dataset = TrainingDataset(filename=data_path)
     dataloader = data.DataLoader(dataset, batch_size=args.batch_size, num_workers=4, shuffle=True)
-    classes = 5
 
     # Define the UNet model
     model = Unet1D_cls_free(
@@ -50,13 +53,13 @@ def train(args):
         dim_mults=(1, 2, 4, 8),
         num_classes=args.num_classes,
         cond_drop_prob=0.5,
-        channels=1
+        channels=args.channels
     ).to(device)
 
     # Define the Gaussian Diffusion model
     diffusion = GaussianDiffusion1D_cls_free(
         model,
-        seq_length=128,
+        seq_length=args.seq_length,
         timesteps=1000
     ).to(device)
     
@@ -108,20 +111,24 @@ def train(args):
             'optimizer': optimizer.state_dict(),
         }, is_best, os.path.join("checkpoint", args.run_name))
 
+def get_args():
+    parser = argparse.ArgumentParser(description="Training 1D Conditional Diffusion Model")
+    parser.add_argument('--run_name', type=str, default='DDPM1D_CLS_FREE')
+    parser.add_argument('--epochs', type=int, default=CFG.epochs)
+    parser.add_argument('--batch_size', type=int, default=CFG.batch_size)
+    parser.add_argument('--channels', type=int, default=CFG.channels)
+    parser.add_argument('--seq_length', type=int, default=CFG.sequence_length)
+    parser.add_argument('--num_classes', type=int, default=CFG.num_classes)
+    parser.add_argument('--device', type=str, default=CFG.device)
+    parser.add_argument('--lr', type=float, default=CFG.learning_rate)
+    parser.add_argument('--resume', action='store_true', help="Riprende dall'ultimo checkpoint disponibile")
+    return parser.parse_args()
+
 def launch():
     """
     Launch the training process with predefined parameters.
     """
-    import argparse
-    parser = argparse.ArgumentParser()
-    args = parser.parse_args()
-    args.run_name = "DDPM1D_cls_free_MITBIH"
-    args.epochs = 100
-    args.batch_size = 32
-    args.seq_length = 128
-    args.num_classes = 5
-    args.device = "cuda:0"
-    args.lr = 3e-4
+    args = get_args()
     train(args)
 
 if __name__ == '__main__':

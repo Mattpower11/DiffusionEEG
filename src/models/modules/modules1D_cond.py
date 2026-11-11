@@ -575,33 +575,67 @@ class GaussianDiffusion1D(nn.Module):
     def p_sample_loop(self, shape, input_cond):
         batch, device = shape[0], self.betas.device
 
+        assert input_cond.shape == shape, \
+            f"Dimensioni incompatibili: input_cond={input_cond.shape}, shape={shape}"
+
+        input_cond = input_cond.to(device)
+
         img = torch.randn(shape, device=device)
 
-        x_start = input_cond
-
-        for t in tqdm(reversed(range(0, self.num_timesteps)), desc = 'sampling loop time step', total = self.num_timesteps):
-            self_cond = x_start if self.self_condition else None
-            img, x_start = self.p_sample(img, t, self_cond)
+        for t in tqdm(
+            reversed(range(0, self.num_timesteps)),
+            desc='sampling loop time step',
+            total=self.num_timesteps
+        ):
+            self_cond = input_cond if self.self_condition else None
+            img, _ = self.p_sample(
+                img,
+                t,
+                self_cond,
+                clip_denoised=False
+            )
 
         img = self.unnormalize(img)
         return img
 
     @torch.no_grad()
-    def ddim_sample(self, shape, input_cond, clip_denoised = True):
-        batch, device, total_timesteps, sampling_timesteps, eta, objective = shape[0], self.betas.device, self.num_timesteps, self.sampling_timesteps, self.ddim_sampling_eta, self.objective
+    def ddim_sample(self, shape, input_cond, clip_denoised=False):
+        batch, device, total_timesteps, sampling_timesteps, eta, objective = (
+            shape[0],
+            self.betas.device,
+            self.num_timesteps,
+            self.sampling_timesteps,
+            self.ddim_sampling_eta,
+            self.objective
+        )
 
-        times = torch.linspace(-1, total_timesteps - 1, steps=sampling_timesteps + 1)   # [-1, 0, 1, 2, ..., T-1] when sampling_timesteps == total_timesteps
+        assert input_cond.shape == shape, \
+            f"Dimensioni incompatibili: input_cond={input_cond.shape}, shape={shape}"
+
+        input_cond = input_cond.to(device)
+
+        times = torch.linspace(
+            -1,
+            total_timesteps - 1,
+            steps=sampling_timesteps + 1
+        )
+
         times = list(reversed(times.int().tolist()))
-        time_pairs = list(zip(times[:-1], times[1:])) # [(T-1, T-2), (T-2, T-3), ..., (1, 0), (0, -1)]
+        time_pairs = list(zip(times[:-1], times[1:]))
 
-        img = torch.randn(shape, device = device)
+        img = torch.randn(shape, device=device)
 
-        x_start = input_cond
-
-        for time, time_next in tqdm(time_pairs, desc = 'sampling loop time step'):
+        for time, time_next in tqdm(time_pairs, desc='sampling loop time step'):
             time_cond = torch.full((batch,), time, device=device, dtype=torch.long)
-            self_cond = x_start if self.self_condition else None
-            pred_noise, x_start, *_ = self.model_predictions(img, time_cond, self_cond, clip_x_start = clip_denoised)
+
+            self_cond = input_cond if self.self_condition else None
+
+            pred_noise, x_start, *_ = self.model_predictions(
+                img,
+                time_cond,
+                self_cond,
+                clip_x_start=clip_denoised
+            )
 
             if time_next < 0:
                 img = x_start
@@ -610,14 +644,21 @@ class GaussianDiffusion1D(nn.Module):
             alpha = self.alphas_cumprod[time]
             alpha_next = self.alphas_cumprod[time_next]
 
-            sigma = eta * ((1 - alpha / alpha_next) * (1 - alpha_next) / (1 - alpha)).sqrt()
+            sigma = eta * (
+                (1 - alpha / alpha_next) *
+                (1 - alpha_next) /
+                (1 - alpha)
+            ).sqrt()
+
             c = (1 - alpha_next - sigma ** 2).sqrt()
 
             noise = torch.randn_like(img)
 
-            img = x_start * alpha_next.sqrt() + \
-                  c * pred_noise + \
-                  sigma * noise
+            img = (
+                x_start * alpha_next.sqrt() +
+                c * pred_noise +
+                sigma * noise
+            )
 
         img = self.unnormalize(img)
         return img
@@ -665,42 +706,52 @@ class GaussianDiffusion1D(nn.Module):
         else:
             raise ValueError(f'invalid loss type {self.loss_type}')
 
-    def p_losses(self, x_start, t, input_cond = None, noise = None):
+    
+    def p_losses(self, x_start, t, input_cond=None, noise=None):
         b, c, n = x_start.shape
+
+        # Il segnale condizionale è obbligatorio per il signal-conditioning
+        assert input_cond is not None, \
+            "Il segnale condizionale input_cond non può essere None."
+
+        # I due segnali devono avere le stesse dimensioni
+        assert input_cond.shape == x_start.shape, \
+            f"Dimensioni incompatibili: x_start={x_start.shape}, input_cond={input_cond.shape}"
+
         noise = default(noise, lambda: torch.randn_like(x_start))
 
-        # noise sample
+        # Forward diffusion: il rumore viene aggiunto esclusivamente
+        # al segnale originale x_start
+        x = self.q_sample(
+            x_start=x_start,
+            t=t,
+            noise=noise
+        )
 
-        x = self.q_sample(x_start = x_start, t = t, noise = noise)
+        # Il segnale condizionale originale viene mantenuto
+        # e fornito sempre alla U-Net
+        model_out = self.model(x, t, input_cond)
 
-        # if doing self-conditioning, 50% of the time, predict x_start from current set of times
-        # and condition with unet with that
-        # this technique will slow down training by 25%, but seems to lower FID significantly
-
-        x_self_cond = input_cond
-        if self.self_condition and random() < 0.5:
-            with torch.no_grad():
-                x_self_cond = self.model_predictions(x, t).pred_x_start
-                x_self_cond.detach_()
-
-        # predict and take gradient step
-
-        model_out = self.model(x, t, x_self_cond)
-
+        # Definizione del target in base all'obiettivo configurato
         if self.objective == 'pred_noise':
             target = noise
+
         elif self.objective == 'pred_x0':
             target = x_start
+
         elif self.objective == 'pred_v':
-            v = self.predict_v(x_start, t, noise)
-            target = v
+            target = self.predict_v(x_start, t, noise)
+
         else:
             raise ValueError(f'unknown objective {self.objective}')
 
-        loss = self.loss_fn(model_out, target, reduction = 'none')
+        # Calcolo della loss
+        loss = self.loss_fn(model_out, target, reduction='none')
         loss = reduce(loss, 'b ... -> b (...)', 'mean')
 
+        # Applicazione dei pesi p2
         loss = loss * extract(self.p2_loss_weight, t, loss.shape)
+
         return loss.mean()
 
     def forward(self, img, cond_img, *args, **kwargs):
@@ -710,7 +761,6 @@ class GaussianDiffusion1D(nn.Module):
 
         img = self.normalize(img)
         return self.p_losses(img, t, cond_img, *args, **kwargs)
-    
     
     
 class EMA:

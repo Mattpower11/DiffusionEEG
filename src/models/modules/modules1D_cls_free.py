@@ -406,15 +406,26 @@ class Unet1D_cls_free(nn.Module):
     def forward_with_cond_scale(
         self,
         *args,
-        cond_scale = 1.,
+        cond_scale=1.,
         **kwargs
     ):
-        logits = self.forward(*args, **kwargs)
+        # Predizione sempre condizionata
+        logits = self.forward(
+            *args,
+            cond_drop_prob=0.,
+            **kwargs
+        )
 
         if cond_scale == 1:
             return logits
 
-        null_logits = self.forward(*args, cond_drop_prob = 1., **kwargs)
+        # Predizione sempre non condizionata
+        null_logits = self.forward(
+            *args,
+            cond_drop_prob=1.,
+            **kwargs
+        )
+
         return null_logits + (logits - null_logits) * cond_scale
 
     def forward(

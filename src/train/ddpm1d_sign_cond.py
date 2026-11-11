@@ -3,9 +3,12 @@ import argparse
 import torch
 import torch.optim as optim
 import torch.utils.data as data
+from conf.sign_cond_conf import sign_cond_conf
 
-from modules.modules1D_cond import Unet1D, GaussianDiffusion1D
+from models.modules.modules1D_cond import Unet1D, GaussianDiffusion1D
 from MITBIH import mitbih_masked
+
+CFG = sign_cond_conf()
 
 
 # Dataset per il caricamento dei segnali ECG condizionati
@@ -22,20 +25,6 @@ class TrainingDataset(data.Dataset):
             'org_data': data_dict['org_data'],
             'cond_data': data_dict['cond_data']
         }
-
-
-def get_args():
-    parser = argparse.ArgumentParser(description="Training 1D Conditional Diffusion Model")
-    parser.add_argument('--run_name', type=str, default='DDPM1D_sign_cond_MITBIH_class0')
-    parser.add_argument('--batch_size', type=int, default=32)
-    parser.add_argument('--lr', type=float, default=1e-4)
-    parser.add_argument('--device', type=str, default='cuda:0')
-    parser.add_argument('--class_id', type=int, default=0)
-    parser.add_argument('--max_iterations', type=int, default=1_000_000)
-    parser.add_argument('--save_every', type=int, default=10_000)
-    parser.add_argument('--resume', action='store_true', help="Riprende dall'ultimo checkpoint disponibile")
-    return parser.parse_args()
-
 
 def find_latest_checkpoint(run_name, checkpoint_dir='./models'):
     """Cerca il checkpoint con lo step più avanzato per il run corrente."""
@@ -137,7 +126,7 @@ def train(args):
         init_dim=None,
         out_dim=None,
         dim_mults=(1, 2, 4, 8, 8),
-        channels=1,
+        channels=args.channels,
         self_condition=True,
         resnet_block_groups=2
     ).to(device)
@@ -145,11 +134,13 @@ def train(args):
     # Modello di diffusione Gaussian
     diffusion = GaussianDiffusion1D(
         model,
-        seq_length=128,
+        seq_length=args.seq_length,
         timesteps=2000,
-        objective='pred_v',
+        sampling_timesteps=2000,
+        objective='pred_noise',
         beta_schedule='linear',
-        loss_type='l1'
+        loss_type='l1',
+        auto_normalize=False
     ).to(device)
 
     optimizer = optim.Adam(model.parameters(), lr=args.lr)
@@ -209,6 +200,21 @@ def train(args):
           f"Training completato con successo!\n"
           f"Iterazioni totali: {global_step} | Class ID: {args.class_id}\n"
           f"==========================================")
+
+
+def get_args():
+    parser = argparse.ArgumentParser(description="Training 1D Conditional Diffusion Model")
+    parser.add_argument('--run_name', type=str, default='DDPM1D_sign_cond_MITBIH_class0')
+    parser.add_argument('--batch_size', type=int, default=CFG.batch_size)
+    parser.add_argument('--channels', type=int, default=CFG.channels)
+    parser.add_argument('--lr', type=float, default=CFG.learning_rate)
+    parser.add_argument('--device', type=str, default=CFG.device)
+    parser.add_argument('--seq_length', type=int, default=CFG.sequence_length)
+    parser.add_argument('--class_id', type=int, default=0)
+    parser.add_argument('--max_iterations', type=int, default=CFG.max_iterations)
+    parser.add_argument('--save_every', type=int, default=CFG.save_every)
+    parser.add_argument('--resume', action='store_true', help="Riprende dall'ultimo checkpoint disponibile")
+    return parser.parse_args()
 
 
 if __name__ == '__main__':
