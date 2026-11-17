@@ -12,65 +12,423 @@ from src.conf import EEG_preprocessing_conf
 class BCI2bGDFPreprocessor:
     def __init__(self, config: EEG_preprocessing_conf):
         self.config = config
+        self.last_gap_report = {}
 
     @staticmethod
     def _normalise_name(name: str) -> str:
         return re.sub(r"[^a-z0-9]", "", name.lower())
 
     def load_gdf_file(self, file_path: Path) -> mne.io.BaseRaw:
-        """Load one GDF file and validate the nominal sampling frequency."""
-        raw = mne.io.read_raw_gdf(str(file_path), preload=True, verbose="ERROR")
+        """Load GDF and validate sampling frequency. Non-finite data are handled downstream."""
+        raw = mne.io.read_raw_gdf(
+            str(file_path), 
+            preload=True, 
+            verbose="ERROR"
+        )
+        
         sfreq = float(raw.info["sfreq"])
+        
         if abs(sfreq - self.config.sfreq_expected) > self.config.sfreq_tolerance:
             raise ValueError(
                 f"{file_path.name}: expected {self.config.sfreq_expected} Hz, "
                 f"got {sfreq} Hz"
             )
-        if not np.isfinite(raw.get_data()).all():
-            raise ValueError(f"{file_path.name}: raw data contain NaN or Inf")
+        
         return raw
 
+    @staticmethod
+    def _interpolate_interval(
+        row: np.ndarray,
+        start: int,
+        stop: int
+    ) -> None:
+        """
+        Interpolate a gap using the nearest valid samples on both sides.
+
+        The interval [start, stop) is excluded from the interpolation anchors.
+        """
+
+        if start <= 0 or stop >= len(row):
+            raise ValueError(
+                f"Cannot safely interpolate a gap at samples {start}:{stop}: "
+                "valid samples must exist on both sides."
+            )
+
+        left_value = row[start - 1]
+        right_value = row[stop]
+
+        if not np.isfinite(left_value) or not np.isfinite(right_value):
+            raise ValueError(
+                f"Invalid interpolation boundaries for gap {start}:{stop}."
+            )
+
+        row[start:stop] = np.linspace(
+            left_value,
+            right_value,
+            stop - start + 2,
+        )[1:-1]
+
+   
     def annotate_and_fill_nonfinite_gaps(
         self,
         raw: mne.io.BaseRaw,
-        guard_seconds: float = 1.0,
+        guard_seconds: Optional[float] = None
     ) -> mne.io.BaseRaw:
-        """Mark non-finite gaps BAD and interpolate only to permit filtering.
-
-        The official 2b documentation notes 100-sample missing gaps between runs
-        in some representations. Epochs near these gaps are rejected later.
         """
+            Detect and handle non-finite samples and BCI Competition IV 2b
+            run separators.
+
+            The method identifies contiguous NaN/Inf intervals and candidate
+            run separators associated with GDF event 32766.
+
+            Candidate run separators are accepted only when the expected
+            number of samples is approximately constant across the
+            inspected channels.
+
+            Detected intervals are linearly interpolated to obtain finite
+            data. The original intervals, expanded by a configurable
+            guard window, are annotated as BAD_acq_skip.
+
+            These annotations allow MNE filtering to avoid crossing
+            acquisition gaps and permit affected epochs to be rejected
+            when reject_by_annotation=True.
+
+            The input Raw object is not modified. The method is intended
+            to be called once per original recording.
+
+            A diagnostic report is stored in self.last_gap_report.
+        """
+
+        self.last_gap_report = {}
+
+        guard = float(
+            self.config.gap_guard_seconds
+            if guard_seconds is None
+            else guard_seconds
+        )
+
+        if not np.isfinite(guard) or guard < 0:
+            raise ValueError(
+                "gap_guard_seconds must be finite and non-negative."
+            )
+
+        n_gap = self.config.expected_run_gap_samples
+
+        if (
+            isinstance(n_gap, (bool, np.bool_))
+            or not isinstance(n_gap, (int, np.integer))
+            or n_gap <= 0
+        ):
+            raise ValueError(
+                "expected_run_gap_samples must be a positive integer."
+            )
+
+        sentinel_tol = float(
+            self.config.sentinel_atol_volts
+        )
+
+        if not np.isfinite(sentinel_tol) or sentinel_tol <= 0:
+            raise ValueError(
+                "sentinel_atol_volts must be finite and positive."
+            )
+
         out = raw.copy().load_data()
+
+        gap_annotation_names = {
+            "bad_acq_skip_run_gap",
+            "bad_acq_skip_nonfinite_gap",
+        }
+
+        already_processed = any(
+            str(description).lower() in gap_annotation_names
+            for description in out.annotations.description
+        )
+
+        if already_processed:
+            raise ValueError(
+                "This Raw object already contains gap annotations "
+                "generated by BCI2bGDFPreprocessor. "
+                "Load the original recording before preprocessing again."
+            )
+
         data = out._data
-        bad_samples = ~np.isfinite(data).all(axis=0)
-        if not bad_samples.any():
-            return out
-        edges = np.diff(np.r_[False, bad_samples, False].astype(np.int8))
-        starts, stops = np.where(edges == 1)[0], np.where(edges == -1)[0]
         sfreq = float(out.info["sfreq"])
-        onsets, durations = [], []
+
+        intervals = []
+        gap_records = []
+
+        # ---------------------------------------------------------
+        # 1. Detect non-finite samples (NaN / Inf)
+        # ---------------------------------------------------------
+
+        nonfinite_mask = ~np.isfinite(data)
+        n_nonfinite_values = int(
+            np.count_nonzero(nonfinite_mask)
+        )
+
+
+        # A time sample is considered affected if at least one
+        # channel contains a non-finite value.
+        bad_time_mask = nonfinite_mask.any(axis=0)
+
+        edges = np.diff(
+            np.r_[False, bad_time_mask, False].astype(np.int8)
+        )
+
+        starts = np.where(edges == 1)[0]
+        stops = np.where(edges == -1)[0]
+
         for a, b in zip(starts, stops):
-            for row in data:
-                finite = np.isfinite(row)
-                known = np.flatnonzero(finite)
-                if len(known) < 2:
-                    raise ValueError("Too few finite samples to interpolate a GDF gap.")
-                row[a:b] = np.interp(np.arange(a, b), known, row[known])
-            onset = max(0.0, a / sfreq - guard_seconds)
-            end = min(out.n_times / sfreq, b / sfreq + guard_seconds)
-            onsets.append(onset)
-            durations.append(max(0.0, end - onset))
-        bad = mne.Annotations(
-            onset=onsets,
-            duration=durations,
-            description=["BAD_nonfinite_gap"] * len(onsets),
-            orig_time=None,
+
+            intervals.append((int(a), int(b), "nonfinite"))
+
+            gap_records.append({
+                "kind": "nonfinite",
+                "start_sample": int(a),
+                "stop_sample": int(b),
+                "n_samples": int(b - a),
+                "duration_seconds": float((b - a) / sfreq),
+                "interpolated": True
+            })
+
+        # ---------------------------------------------------------
+        # 2. Detect 32766 run separators
+        # ---------------------------------------------------------
+        marker_candidates = 0
+        marker_rejected = []
+
+        events, event_id = mne.events_from_annotations(
+            out,
+            verbose="ERROR"
         )
-        out.set_annotations(out.annotations + bad)
-        warnings.warn(
-            f"Found {len(onsets)} non-finite gap(s); interpolated for filtering "
-            "and marked expanded intervals BAD so affected epochs are rejected."
+
+        print("\n--- GDF EVENT DESCRIPTIONS ---")
+
+        for description, code in event_id.items():
+            print(f"Description: {description} | Code: {code}")
+
+        print("------------------------------\n")
+
+        marker_codes = [
+            code
+            for description, code in event_id.items()
+            if str(description).strip() == "32766"
+        ]
+
+        for marker_code in marker_codes:
+            marker_samples = (
+                events[events[:, 2] == marker_code, 0] - out.first_samp
+            )
+
+            for marker_sample in marker_samples:
+                marker_candidates += 1
+
+                a = int(marker_sample)
+                b = a + n_gap
+
+                if a < 1 or b >= out.n_times:
+                    marker_rejected.append({
+                        "start_sample": a,
+                        "reason": "out_of_bounds",
+                    })
+                    continue
+
+                segment = data[:, a:b]
+
+                if not np.isfinite(segment).all():
+                    marker_rejected.append({
+                        "start_sample": a,
+                        "reason": "nonfinite_values",
+                    })
+                    continue
+
+                channel_ranges = np.ptp(segment, axis=1)
+
+                is_constant = bool(
+                    np.all(channel_ranges <= sentinel_tol)
+                )
+
+                if not is_constant:
+                    marker_rejected.append({
+                        "start_sample": a,
+                        "reason": "not_constant",
+                        "channel_names": list(out.ch_names),
+                        "channel_ranges_volts": channel_ranges.tolist(),
+                    })
+                    continue
+
+                overlaps = any(
+                    a < old_b and b > old_a
+                    for old_a, old_b, _ in intervals
+                )
+
+                if overlaps:
+                    marker_rejected.append({
+                        "start_sample": a,
+                        "reason": "overlapping_interval",
+                    })
+                    continue
+
+                intervals.append((a, b, "run_gap"))
+
+                gap_records.append({
+                    "kind": "run_gap_32766",
+                    "start_sample": a,
+                    "stop_sample": b,
+                    "n_samples": n_gap,
+                    "duration_seconds": float(n_gap / sfreq),
+                    "interpolated": True,
+                    "channel_ranges_volts": channel_ranges.tolist(),
+                })
+
+        if not marker_codes:
+            warnings.warn(
+                "No annotation with description '32766' was found. "
+                "Run-separator detection was not performed."
+            )
+
+        # ---------------------------------------------------------
+        # 3. Interpolate detected intervals
+        # ---------------------------------------------------------
+
+        for a, b, kind in intervals:
+            for channel_idx in range(data.shape[0]):
+                row = data[channel_idx]
+
+                if kind == "nonfinite":
+                    # Identify non-finite samples for this channel.
+                    channel_bad = ~np.isfinite(row[a:b])
+
+                    if not channel_bad.any():
+                        continue
+
+                    # Identify contiguous non-finite intervals.
+                    edges = np.diff(
+                        np.r_[False, channel_bad, False].astype(np.int8)
+                    )
+
+                    starts = np.where(edges == 1)[0]
+                    stops = np.where(edges == -1)[0]
+
+                    for start, stop in zip(starts, stops):
+                        gap_start = a + int(start)
+                        gap_stop = a + int(stop)
+
+                        try:
+                            self._interpolate_interval(
+                                row,
+                                gap_start,
+                                gap_stop,
+                            )
+                        except ValueError as exc:
+                            raise ValueError(
+                                f"Interpolation failed for channel "
+                                f"{out.ch_names[channel_idx]!r}, "
+                                f"interval [{gap_start}, {gap_stop}): {exc}"
+                            ) from exc
+
+                elif kind == "run_gap":
+                    try:
+                        self._interpolate_interval(
+                            row,
+                            a,
+                            b,
+                        )
+                    except ValueError as exc:
+                        raise ValueError(
+                            f"Interpolation failed for channel "
+                            f"{out.ch_names[channel_idx]!r}, "
+                            f"interval [{a}, {b}): {exc}"
+                        ) from exc
+
+        n_remaining_nonfinite = int(
+            np.count_nonzero(~np.isfinite(data))
         )
+
+        if n_remaining_nonfinite:
+            raise RuntimeError(
+                f"Interpolation incomplete: "
+                f"{n_remaining_nonfinite} non-finite values remain."
+            )
+
+        # ---------------------------------------------------------
+        # 4. Create BAD annotations with guard intervals
+        # ---------------------------------------------------------
+        guard_samples = int(round(guard * sfreq))
+        guarded_mask = np.zeros(out.n_times, dtype=bool)
+
+        for a, b, kind in intervals:
+
+            guarded_start = max(0, a - guard_samples)
+            guarded_stop = min(out.n_times, b + guard_samples)
+            guarded_mask[guarded_start:guarded_stop] = True
+
+            onset = out.first_time + guarded_start / sfreq
+            duration = (guarded_stop - guarded_start) / sfreq
+
+            description = (
+                "BAD_acq_skip_run_gap"
+                if kind == "run_gap"
+                else "BAD_acq_skip_nonfinite_gap"
+            )
+
+            out.annotations.append(
+                onset=onset,
+                duration=duration,
+                description=description,
+            )
+
+        # ---------------------------------------------------------
+        # 5. Save diagnostic report
+        # ---------------------------------------------------------
+        self.last_gap_report = {
+            "n_gaps": len(gap_records),
+
+            "n_nonfinite_gaps": sum(
+                x["kind"] == "nonfinite"
+                for x in gap_records
+            ),
+
+            "n_run_gaps": sum(
+                x["kind"] == "run_gap_32766"
+                for x in gap_records
+            ),
+
+            "n_run_marker_candidates": marker_candidates,
+            "n_run_marker_rejected": len(marker_rejected),
+            "rejected_run_markers": marker_rejected,
+
+            "n_affected_time_samples": int(
+                sum(x["n_samples"] for x in gap_records)
+            ),
+
+            "gap_duration_seconds": float(
+                sum(x["n_samples"] for x in gap_records) / sfreq
+            ),
+
+            "n_remaining_nonfinite_values": n_remaining_nonfinite,
+
+            "n_interpolated_values": (
+                n_nonfinite_values
+                + sum(
+                    data.shape[0] * (b - a)
+                    for a, b, kind in intervals
+                    if kind == "run_gap"
+                )
+            ),
+
+            "n_bad_annotated_samples": int(guarded_mask.sum()),
+
+            "guard_seconds": float(guard),
+            "gaps": gap_records,
+        }
+
+        if gap_records:
+            warnings.warn(
+                f"{len(gap_records)} gap(s) detected and interpolated. "
+                "The corresponding guarded intervals were marked BAD."
+            )
+
         return out
 
     def select_eeg_channels(
@@ -79,31 +437,58 @@ class BCI2bGDFPreprocessor:
         eeg_names: Optional[Sequence[str]] = None,
     ) -> Tuple[mne.io.BaseRaw, List[str], List[str]]:
         """
-        Select the three EEG channels by name, never by array position.
+            Select exactly three distinct EEG channels by name.
 
-        Exact normalized-name matching is used. If labels contain suffixes such as
-        'C3..' or 'EEG-C3', edit eeg_channel_names / this resolver after inspecting
-        raw.ch_names. Ambiguous or missing channels raise an informative error.
+            Normalized exact-name matching is preferred. If no exact
+            match exists, normalized suffix matching is attempted.
+
+            Missing or ambiguous matches raise a ValueError.
+            EOG channels cannot be selected as EEG inputs.
+
+            Returns
+            -------
+            eeg_raw : mne.io.BaseRaw
+                Copy containing the selected EEG channels.
+            selected : List[str]
+                Resolved EEG channel names.
+            eog_names : List[str]
+                Detected EOG channel names in the original recording.
         """
+
         if eeg_names is None:
             eeg_names = self.config.eeg_channel_names
 
         available = list(raw.ch_names)
-        selected: List[str] = []
+        selected = []
         for requested in eeg_names:
             key = self._normalise_name(requested)
-            matches = [
+
+            if not key:
+                raise ValueError(
+                    f"Invalid EEG channel name: {requested!r}"
+                )
+
+            exact_matches = [
                 name
                 for name in available
                 if self._normalise_name(name) == key
-                or self._normalise_name(name).endswith(key)
             ]
+
+            if exact_matches:
+                matches = exact_matches
+            else:
+                matches = [
+                    name
+                    for name in available
+                    if self._normalise_name(name).endswith(key)
+                ]
+
             if len(matches) != 1:
                 raise ValueError(
                     f"Cannot uniquely resolve EEG channel {requested!r}. "
-                    f"Available channels: {available}. Inspect labels and configure "
-                    "EEGConfig.eeg_channel_names."
+                    f"Available channels: {available}"
                 )
+            
             selected.append(matches[0])
 
         if len(selected) != 3 or len(set(selected)) != 3:

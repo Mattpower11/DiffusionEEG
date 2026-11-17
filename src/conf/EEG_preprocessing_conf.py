@@ -4,6 +4,9 @@ from typing import Optional, Tuple
 
 @dataclass
 class EEG_preprocessing_conf:
+    # Automatic preprocessing diagnostics
+    report_output_dir: str = "./report/processing"
+
     sfreq_expected: float = 250.0
     sfreq_tolerance: float = 0.01
 
@@ -12,6 +15,13 @@ class EEG_preprocessing_conf:
     # GDF channel labels must be inspected; no positional assumption is made.
     eeg_channel_names: Tuple[str, ...] = ("C3", "Cz", "C4")
     eog_channel_pattern: str = r"(?i)\bEOG\b|EOG"
+
+    # Gap handling
+    gap_guard_seconds: float = 0.5
+    expected_run_gap_samples: int = 100
+
+    # Tolerance for detecting constant sentinel intervals (Volts)
+    sentinel_atol_volts: float = 1e-9
 
     l_freq: float = 0.5
     h_freq: float = 40.0
@@ -22,19 +32,22 @@ class EEG_preprocessing_conf:
     # period relative to the 769/770 cue-onset event. Do not mix 03T feedback
     # sessions without defining a separate, protocol-appropriate epoch window.
     tmin: float = 1.25
-    tmax: float = 3.246  # 500 samples at 250 Hz, inclusive endpoints
+    tmax: float = 3.244  # 500 samples at 250 Hz, inclusive endpoints
 
     sequence_length: Optional[int] = 500  # None preserves native epoch samples
     resample_sfreq: Optional[float] = None  # None preserves 250 Hz
     overlap: float = 0.0  # reserved for optional sliding-window extension
 
     artifact_mode: str = "basic"  # "basic" or "ica"
-    amplitude_threshold_uv: float = 150.0
     peak_to_peak_threshold_uv: float = 200.0
     flat_threshold_uv: float = 0.5
 
+    ica_eog_threshold: float = 0.7
+    ica_auto_remove: bool = False
+    ica_max_components_to_remove: int = 1
+    ica_strict: bool = True
+
     normalization: str = "train"  # "train" or "trial"
     eps: float = 1e-6
-
     random_seed: int = 42
 

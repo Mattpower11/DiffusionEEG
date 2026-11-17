@@ -74,6 +74,16 @@ def main():
     if not files:
         raise FileNotFoundError(f"No files matching {args.pattern} in {args.data_dir}")
 
+    # The pipeline always generates its diagnostic reports. Keep them with
+    # the processed arrays and reset the per-trial CSV for this full run.
+    CFG.report_output_dir = str(args.output_dir / "reports")
+    report_dir = Path(CFG.report_output_dir)
+    report_dir.mkdir(parents=True, exist_ok=True)
+    audit_file = report_dir / "trial_audit.csv"
+
+    if audit_file.exists():
+        audit_file.unlink()
+
     X, y, metadata = DATA_PREPROCESSOR.preprocess_dataset(files)
     DIAGNOSTICS.print_diagnostics(X, y)
 
