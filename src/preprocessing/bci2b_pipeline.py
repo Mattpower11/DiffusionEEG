@@ -4,6 +4,7 @@ from pathlib import Path
 from typing import List, Sequence, Tuple
 from collections import Counter
 
+import mne
 import numpy as np
 
 from src.conf import EEG_preprocessing_conf
@@ -19,6 +20,7 @@ class BCI2bPreprocessor:
         self.signal_preprocessor = BCI2bSignalPreprocessor(config)
         self.epoch_preprocessor = BCI2bEpochPreprocessor(config)
         self._file_reports = []
+        self.unfiltered_epochs = []
 
     @staticmethod
     def _json_safe(value):
@@ -68,9 +70,10 @@ class BCI2bPreprocessor:
                 writer.writerow({key: row.get(key) for key in fields})
 
     def preprocess_file(
-            self, 
-            file_path: Path
-        ) -> Tuple[np.ndarray, np.ndarray, dict]:
+        self,
+        file_path: Path,
+        collect_unfiltered: bool = False,
+    ) -> Tuple[np.ndarray, np.ndarray, dict]:
         file_path = Path(file_path)
         raw_full = self.gdf_preprocessor.load_gdf_file(file_path)
         raw_full = self.gdf_preprocessor.annotate_and_fill_nonfinite_gaps(raw_full)
@@ -81,24 +84,76 @@ class BCI2bPreprocessor:
         
         x, y, event_codes = self.epoch_preprocessor.extract_epochs(cleaned, raw_full)
 
-        ''' INIZIO TEST '''
-        required = (
-            (self.epoch_preprocessor, "last_trial_report"),
-            (self.signal_preprocessor, "last_filter_report"),
-            (self.signal_preprocessor, "last_artifact_report"),
-            (self.gdf_preprocessor, "last_gap_report"),
-        )
+        if collect_unfiltered:
+            trials = self.epoch_preprocessor.last_trial_report
+            kept_trials = [
+                trial for trial in trials
+                if trial["kept"]
+            ]
 
-        for module, attribute in required:
-            if not hasattr(module, attribute):
-                raise RuntimeError(
-                    f"{type(module).__name__} does not expose {attribute}. "
-                    "Update all preprocessing modules to the report-enabled versions."
+            # Use the exact event samples retained by preprocessing.
+            events = np.array(
+                [
+                    [int(trial["event_sample"]), 0, int(trial["label"]) + 1]
+                    for trial in kept_trials
+                ],
+                dtype=int
+            )
+
+            if len(events) != len(x):
+                raise ValueError(
+                    "Mismatch between kept trials and filtered epochs."
                 )
-        ''' FINE TEST '''
+
+            # Extract identical time intervals BEFORE filtering.
+            epochs_before = mne.Epochs(
+                raw_eeg,
+                events,
+                event_id={
+                    "left_hand": 1,
+                    "right_hand": 2,
+                },
+                on_missing="ignore",
+                tmin=self.config.tmin,
+                tmax=self.config.tmax,
+                baseline=None,
+                preload=True,
+                reject_by_annotation=False,
+                reject=None,
+                flat=None,
+                verbose="ERROR",
+            )
+
+            X_before = epochs_before.get_data(copy=True)
+
+            # Confirm that MNE did not discard or reorder events.
+            if not np.array_equal(
+                epochs_before.events[:, 0],
+                events[:, 0]
+            ):
+                raise ValueError(
+                    "Unfiltered epoch alignment mismatch."
+                )
+
+            if not np.array_equal(
+                epochs_before.events[:, 2] - 1,
+                y
+            ):
+                raise ValueError(
+                    "Unfiltered epoch labels do not match."
+                )
+
+            if X_before.shape != x.shape:
+                raise ValueError(
+                    f"Unfiltered shape {X_before.shape} "
+                    f"does not match filtered shape {x.shape}."
+                )
+
+            self.unfiltered_epochs.append(
+                X_before.astype(np.float32)
+            )
 
         trials = self.epoch_preprocessor.last_trial_report
-
 
         if not isinstance(trials, list) or not trials:
             raise ValueError(f"{file_path.name}: trial audit is empty or invalid")
@@ -165,11 +220,13 @@ class BCI2bPreprocessor:
         return x, y, metadata
 
     def preprocess_dataset(
-        self, 
-        gdf_files: Sequence[Path]
+        self,
+        gdf_files: Sequence[Path],
+        collect_unfiltered: bool = False
     ) -> Tuple[np.ndarray, np.ndarray, List[dict]]:
         xs, ys, metadata = [], [], []
         self._file_reports = []
+        self.unfiltered_epochs = []
 
         gdf_files = [Path(p) for p in gdf_files]
 
@@ -192,7 +249,7 @@ class BCI2bPreprocessor:
             aggregate_path.unlink()
         
         for file_path in gdf_files:
-            x, y, meta = self.preprocess_file(Path(file_path))
+            x, y, meta = self.preprocess_file(Path(file_path), collect_unfiltered=collect_unfiltered)
             xs.append(x)
             ys.append(y)
             metadata.append(meta)

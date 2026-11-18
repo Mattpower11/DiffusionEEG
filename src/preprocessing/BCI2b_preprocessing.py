@@ -84,7 +84,7 @@ def main():
     if audit_file.exists():
         audit_file.unlink()
 
-    X, y, metadata = DATA_PREPROCESSOR.preprocess_dataset(files)
+    X, y, metadata = DATA_PREPROCESSOR.preprocess_dataset(files, collect_unfiltered=args.plot)
     DIAGNOSTICS.print_diagnostics(X, y)
 
     # IMPORTANT: this script treats the supplied files as the training split.
@@ -118,6 +118,41 @@ def main():
             X,
             y,
             sfreq=CFG.sfreq_expected,
+            output_dir=args.output_dir / "plots",
+        )
+
+        X_before = np.concatenate(DATA_PREPROCESSOR.unfiltered_epochs, axis=0)
+
+        if X_before.shape != X.shape:
+            raise ValueError(
+                "PSD comparison requires matching before/after arrays."
+            )
+
+        DIAGNOSTICS.plot_psd_comparison(
+            X_before=X_before,
+            X_after=X,
+            sfreq=CFG.sfreq_expected,
+            output_dir=args.output_dir / "plots",
+        )
+
+        DIAGNOSTICS.plot_multiple_epochs(
+            X=X,
+            y=y,
+            sfreq=CFG.sfreq_expected,
+            output_dir=args.output_dir / "plots",
+            n_per_class=3,
+            random_seed=CFG.random_seed
+        )
+
+        DIAGNOSTICS.plot_peak_to_peak_distribution(
+            X=X,
+            threshold_uv=CFG.peak_to_peak_threshold_uv,
+            output_dir=args.output_dir / "plots"
+        )
+
+        DIAGNOSTICS.plot_trials_by_subject(
+            report_path=Path(CFG.report_output_dir)
+                        / "preprocessing_report.json",
             output_dir=args.output_dir / "plots",
         )
 
