@@ -19,16 +19,15 @@ class BCI2bGDFPreprocessor:
         return re.sub(r"[^a-z0-9]", "", name.lower())
 
     def load_gdf_file(self, file_path: Path) -> mne.io.BaseRaw:
-        """Load GDF and validate sampling frequency. Non-finite data are handled downstream."""
-        raw = mne.io.read_raw_gdf(
-            str(file_path), 
-            preload=True, 
-            verbose="ERROR"
-        )
-        
+        """Load any training/evaluation GDF, retaining its original annotations.
+
+        Non-finite samples are intentionally handled in the following step.
+        """
+        file_path = Path(file_path)
+        raw = mne.io.read_raw_gdf(str(file_path), preload=True, verbose="ERROR")
         sfreq = float(raw.info["sfreq"])
         
-        if abs(sfreq - self.config.sfreq_expected) > self.config.sfreq_tolerance:
+        if not np.isfinite(sfreq) or abs(sfreq - self.config.sfreq_expected) > self.config.sfreq_tolerance:
             raise ValueError(
                 f"{file_path.name}: expected {self.config.sfreq_expected} Hz, "
                 f"got {sfreq} Hz"
@@ -37,398 +36,216 @@ class BCI2bGDFPreprocessor:
         return raw
 
     @staticmethod
-    def _interpolate_interval(
-        row: np.ndarray,
-        start: int,
-        stop: int
-    ) -> None:
-        """
-        Interpolate a gap using the nearest valid samples on both sides.
-
-        The interval [start, stop) is excluded from the interpolation anchors.
-        """
-
-        if start <= 0 or stop >= len(row):
+    def _interpolate_interval(row: np.ndarray, start: int, stop: int) -> None:
+        """Linearly interpolate [start, stop) using two finite boundary samples."""
+        if start <= 0 or stop >= len(row) or start >= stop:
             raise ValueError(
-                f"Cannot safely interpolate a gap at samples {start}:{stop}: "
-                "valid samples must exist on both sides."
+                f"Cannot interpolate interval [{start}, {stop}): "
+                "finite anchors on both sides are required."
             )
+        
+        left, right = row[start - 1], row[stop]
+        
+        if not np.isfinite(left) or not np.isfinite(right):
+            raise ValueError(f"Non-finite interpolation anchors at [{start}, {stop}).")
+        
+        row[start:stop] = np.linspace(left, right, stop - start + 2)[1:-1]
 
-        left_value = row[start - 1]
-        right_value = row[stop]
+    @staticmethod
+    def _runs(mask: np.ndarray) -> List[Tuple[int, int]]:
+        edges = np.diff(np.r_[False, mask, False].astype(np.int8))
+        return list(zip(np.flatnonzero(edges == 1).tolist(),
+                        np.flatnonzero(edges == -1).tolist()))
 
-        if not np.isfinite(left_value) or not np.isfinite(right_value):
-            raise ValueError(
-                f"Invalid interpolation boundaries for gap {start}:{stop}."
-            )
-
-        row[start:stop] = np.linspace(
-            left_value,
-            right_value,
-            stop - start + 2,
-        )[1:-1]
-
-   
     def annotate_and_fill_nonfinite_gaps(
         self,
         raw: mne.io.BaseRaw,
-        guard_seconds: Optional[float] = None
+        guard_seconds: Optional[float] = None,
     ) -> mne.io.BaseRaw:
         """
-            Detect and handle non-finite samples and BCI Competition IV 2b
-            run separators.
+        Interpolate verified acquisition gaps and annotate their guarded spans.
 
-            The method identifies contiguous NaN/Inf intervals and candidate
-            run separators associated with GDF event 32766.
+        A configured run-start event is only a *candidate*: the following
+        configured number of samples must be finite and approximately constant on all recorded
+        channels. The original event annotations are preserved. Added BAD_acq_skip
+        annotations prevent default MNE filtering from crossing the gaps, and
+        enable rejection of overlapping epochs with reject_by_annotation=True.
 
-            Candidate run separators are accepted only when the expected
-            number of samples is approximately constant across the
-            inspected channels.
-
-            Detected intervals are linearly interpolated to obtain finite
-            data. The original intervals, expanded by a configurable
-            guard window, are annotated as BAD_acq_skip.
-
-            These annotations allow MNE filtering to avoid crossing
-            acquisition gaps and permit affected epochs to be rejected
-            when reject_by_annotation=True.
-
-            The input Raw object is not modified. The method is intended
-            to be called once per original recording.
-
-            A diagnostic report is stored in self.last_gap_report.
+        This method is intended to be run once on each original GDF recording.
+        The input Raw is never mutated.
         """
-
         self.last_gap_report = {}
-
+        
+        # A caller-supplied value takes precedence; otherwise use the shared
+        # configuration (the existing pipeline explicitly passes 1.0 s).
         guard = float(
             self.config.gap_guard_seconds
             if guard_seconds is None
             else guard_seconds
         )
-
+        
         if not np.isfinite(guard) or guard < 0:
-            raise ValueError(
-                "gap_guard_seconds must be finite and non-negative."
-            )
+            raise ValueError("guard_seconds must be finite and non-negative")
 
-        n_gap = self.config.expected_run_gap_samples
+        n_gap = getattr(self.config, "expected_run_gap_samples", 100)
+        
+        if isinstance(n_gap, (bool, np.bool_)) or not isinstance(n_gap, (int, np.integer)) or n_gap <= 0:
+            raise ValueError("expected_run_gap_samples must be a positive integer")
+        
+        n_gap = int(n_gap)
 
-        if (
-            isinstance(n_gap, (bool, np.bool_))
-            or not isinstance(n_gap, (int, np.integer))
-            or n_gap <= 0
-        ):
-            raise ValueError(
-                "expected_run_gap_samples must be a positive integer."
-            )
-
-        sentinel_tol = float(
-            self.config.sentinel_atol_volts
-        )
-
-        if not np.isfinite(sentinel_tol) or sentinel_tol <= 0:
-            raise ValueError(
-                "sentinel_atol_volts must be finite and positive."
-            )
+        tol = float(getattr(self.config, "sentinel_atol_volts", 1e-9))
+        if not np.isfinite(tol) or tol <= 0:
+            raise ValueError("sentinel_atol_volts must be finite and positive")
 
         out = raw.copy().load_data()
-
-        gap_annotation_names = {
-            "bad_acq_skip_run_gap",
-            "bad_acq_skip_nonfinite_gap",
-        }
-
-        already_processed = any(
-            str(description).lower() in gap_annotation_names
-            for description in out.annotations.description
-        )
-
-        if already_processed:
-            raise ValueError(
-                "This Raw object already contains gap annotations "
-                "generated by BCI2bGDFPreprocessor. "
-                "Load the original recording before preprocessing again."
-            )
+        marker_names = {"bad_acq_skip_run_gap", "bad_acq_skip_nonfinite_gap"}
+        if any(str(desc).lower() in marker_names for desc in out.annotations.description):
+            raise ValueError("Gaps already annotated by this preprocessor; reload original GDF")
 
         data = out._data
         sfreq = float(out.info["sfreq"])
+        intervals: List[Tuple[int, int, str]] = []
+        records = []
 
-        intervals = []
-        gap_records = []
-
-        # ---------------------------------------------------------
-        # 1. Detect non-finite samples (NaN / Inf)
-        # ---------------------------------------------------------
-
-        nonfinite_mask = ~np.isfinite(data)
-        n_nonfinite_values = int(
-            np.count_nonzero(nonfinite_mask)
-        )
-
-
-        # A time sample is considered affected if at least one
-        # channel contains a non-finite value.
-        bad_time_mask = nonfinite_mask.any(axis=0)
-
-        edges = np.diff(
-            np.r_[False, bad_time_mask, False].astype(np.int8)
-        )
-
-        starts = np.where(edges == 1)[0]
-        stops = np.where(edges == -1)[0]
-
-        for a, b in zip(starts, stops):
-
-            intervals.append((int(a), int(b), "nonfinite"))
-
-            gap_records.append({
-                "kind": "nonfinite",
-                "start_sample": int(a),
-                "stop_sample": int(b),
-                "n_samples": int(b - a),
-                "duration_seconds": float((b - a) / sfreq),
-                "interpolated": True
+        original_bad = ~np.isfinite(data)
+        n_nonfinite = int(original_bad.sum())
+        
+        for start, stop in self._runs(original_bad.any(axis=0)):
+            intervals.append((start, stop, "nonfinite"))
+            records.append({
+                "kind": "nonfinite", "start_sample": start, "stop_sample": stop,
+                "n_samples": stop - start, "duration_seconds": (stop - start) / sfreq,
+                "operation": "interpolate_nonfinite_values_and_annotate_BAD",
+                "interpolated": True,
             })
 
-        # ---------------------------------------------------------
-        # 2. Detect 32766 run separators
-        # ---------------------------------------------------------
-        marker_candidates = 0
-        marker_rejected = []
-
-        events, event_id = mne.events_from_annotations(
-            out,
-            verbose="ERROR"
-        )
-
-        print("\n--- GDF EVENT DESCRIPTIONS ---")
-
-        for description, code in event_id.items():
-            print(f"Description: {description} | Code: {code}")
-
-        print("------------------------------\n")
-
-        marker_codes = [
-            code
-            for description, code in event_id.items()
-            if str(description).strip() == "32766"
-        ]
-
-        for marker_code in marker_codes:
-            marker_samples = (
-                events[events[:, 2] == marker_code, 0] - out.first_samp
-            )
-
-            for marker_sample in marker_samples:
-                marker_candidates += 1
-
-                a = int(marker_sample)
-                b = a + n_gap
-
-                if a < 1 or b >= out.n_times:
-                    marker_rejected.append({
-                        "start_sample": a,
-                        "reason": "out_of_bounds",
-                    })
+        # Get event positions through MNE, without changing annotation order or types.
+        events, event_id = mne.events_from_annotations(out, verbose="ERROR")
+        marker_description = str(getattr(self.config, "run_start_annotation", "32766")).strip()
+        
+        if not marker_description:
+            raise ValueError("run_start_annotation must not be empty")
+     
+        marker_codes = [code for desc, code in event_id.items()
+                        if str(desc).strip() == marker_description]
+        candidates = 0
+        rejected = []
+        
+        for code in marker_codes:
+            samples = events[events[:, 2] == code, 0] - out.first_samp
+            for sample in samples:
+                candidates += 1
+                start = int(sample)
+                stop = start + n_gap
+                reason = None
+                ranges = None
+                
+                if start <= 0 or stop >= out.n_times:
+                    reason = "out_of_bounds_or_no_interpolation_anchors"
+                else:
+                    segment = data[:, start:stop]
+                    
+                    if not np.isfinite(segment).all():
+                        reason = "nonfinite_values"
+                    else:
+                        ranges = np.ptp(segment, axis=1)
+                        
+                        if not bool(np.all(ranges <= tol)):
+                            reason = "not_constant"
+                        elif any(start < b and stop > a for a, b, _ in intervals):
+                            reason = "overlapping_interval"
+                
+                if reason is not None:
+                    item = {"start_sample": start, "reason": reason}
+                    
+                    if ranges is not None:
+                        item["channel_names"] = list(out.ch_names)
+                        item["channel_ranges"] = ranges.tolist()
+                    rejected.append(item)
                     continue
 
-                segment = data[:, a:b]
-
-                if not np.isfinite(segment).all():
-                    marker_rejected.append({
-                        "start_sample": a,
-                        "reason": "nonfinite_values",
-                    })
-                    continue
-
-                channel_ranges = np.ptp(segment, axis=1)
-
-                is_constant = bool(
-                    np.all(channel_ranges <= sentinel_tol)
-                )
-
-                if not is_constant:
-                    marker_rejected.append({
-                        "start_sample": a,
-                        "reason": "not_constant",
-                        "channel_names": list(out.ch_names),
-                        "channel_ranges_volts": channel_ranges.tolist(),
-                    })
-                    continue
-
-                overlaps = any(
-                    a < old_b and b > old_a
-                    for old_a, old_b, _ in intervals
-                )
-
-                if overlaps:
-                    marker_rejected.append({
-                        "start_sample": a,
-                        "reason": "overlapping_interval",
-                    })
-                    continue
-
-                intervals.append((a, b, "run_gap"))
-
-                gap_records.append({
-                    "kind": "run_gap_32766",
-                    "start_sample": a,
-                    "stop_sample": b,
-                    "n_samples": n_gap,
-                    "duration_seconds": float(n_gap / sfreq),
+                intervals.append((start, stop, "run_gap"))
+                records.append({
+                    "kind": "run_gap_32766", "start_sample": start,
+                    "stop_sample": stop, "n_samples": n_gap,
+                    "duration_seconds": n_gap / sfreq,
+                    "operation": "interpolate_all_channels_and_annotate_BAD",
                     "interpolated": True,
-                    "channel_ranges_volts": channel_ranges.tolist(),
+                    "channel_names": list(out.ch_names),
+                    "channel_ranges": ranges.tolist(),
                 })
 
-        if not marker_codes:
-            warnings.warn(
-                "No annotation with description '32766' was found. "
-                "Run-separator detection was not performed."
-            )
-
-        # ---------------------------------------------------------
-        # 3. Interpolate detected intervals
-        # ---------------------------------------------------------
-
-        for a, b, kind in intervals:
-            for channel_idx in range(data.shape[0]):
-                row = data[channel_idx]
-
+        # For non-finite data, interpolate only the non-finite values per channel.
+        # For verified run gaps, interpolate the entire constant block.
+        for start, stop, kind in intervals:
+            for channel_idx, row in enumerate(data):
                 if kind == "nonfinite":
-                    # Identify non-finite samples for this channel.
-                    channel_bad = ~np.isfinite(row[a:b])
-
-                    if not channel_bad.any():
-                        continue
-
-                    # Identify contiguous non-finite intervals.
-                    edges = np.diff(
-                        np.r_[False, channel_bad, False].astype(np.int8)
-                    )
-
-                    starts = np.where(edges == 1)[0]
-                    stops = np.where(edges == -1)[0]
-
-                    for start, stop in zip(starts, stops):
-                        gap_start = a + int(start)
-                        gap_stop = a + int(stop)
-
-                        try:
-                            self._interpolate_interval(
-                                row,
-                                gap_start,
-                                gap_stop,
-                            )
-                        except ValueError as exc:
-                            raise ValueError(
-                                f"Interpolation failed for channel "
-                                f"{out.ch_names[channel_idx]!r}, "
-                                f"interval [{gap_start}, {gap_stop}): {exc}"
-                            ) from exc
-
-                elif kind == "run_gap":
+                    channel_runs = [(start + a, start + b)
+                                    for a, b in self._runs(~np.isfinite(row[start:stop]))]
+                else:
+                    channel_runs = [(start, stop)]
+                
+                for a, b in channel_runs:
                     try:
-                        self._interpolate_interval(
-                            row,
-                            a,
-                            b,
-                        )
+                        self._interpolate_interval(row, a, b)
                     except ValueError as exc:
                         raise ValueError(
-                            f"Interpolation failed for channel "
-                            f"{out.ch_names[channel_idx]!r}, "
-                            f"interval [{a}, {b}): {exc}"
+                            f"Interpolation failed for {out.ch_names[channel_idx]!r} "
+                            f"at samples [{a}, {b}): {exc}"
                         ) from exc
 
-        n_remaining_nonfinite = int(
-            np.count_nonzero(~np.isfinite(data))
-        )
+        remaining = int((~np.isfinite(data)).sum())
+        
+        if remaining:
+            raise RuntimeError(f"{remaining} NaN/Inf values remain after interpolation")
 
-        if n_remaining_nonfinite:
-            raise RuntimeError(
-                f"Interpolation incomplete: "
-                f"{n_remaining_nonfinite} non-finite values remain."
-            )
-
-        # ---------------------------------------------------------
-        # 4. Create BAD annotations with guard intervals
-        # ---------------------------------------------------------
-        guard_samples = int(round(guard * sfreq))
         guarded_mask = np.zeros(out.n_times, dtype=bool)
-
-        for a, b, kind in intervals:
-
-            guarded_start = max(0, a - guard_samples)
-            guarded_stop = min(out.n_times, b + guard_samples)
-            guarded_mask[guarded_start:guarded_stop] = True
-
-            onset = out.first_time + guarded_start / sfreq
-            duration = (guarded_stop - guarded_start) / sfreq
-
-            description = (
-                "BAD_acq_skip_run_gap"
-                if kind == "run_gap"
-                else "BAD_acq_skip_nonfinite_gap"
-            )
-
+        guard_samples = int(round(guard * sfreq))
+        
+        for start, stop, kind in intervals:
+            first = max(0, start - guard_samples)
+            last = min(out.n_times, stop + guard_samples)
+            guarded_mask[first:last] = True
             out.annotations.append(
-                onset=onset,
-                duration=duration,
-                description=description,
+                onset=out.first_time + first / sfreq,
+                duration=(last - first) / sfreq,
+                description=("BAD_acq_skip_run_gap" if kind == "run_gap"
+                             else "BAD_acq_skip_nonfinite_gap"),
             )
 
-        # ---------------------------------------------------------
-        # 5. Save diagnostic report
-        # ---------------------------------------------------------
         self.last_gap_report = {
-            "n_gaps": len(gap_records),
-
-            "n_nonfinite_gaps": sum(
-                x["kind"] == "nonfinite"
-                for x in gap_records
+            "n_gaps": len(records),
+            "n_nonfinite_gaps": sum(r["kind"] == "nonfinite" for r in records),
+            "n_run_gaps": sum(r["kind"] == "run_gap_32766" for r in records),
+            "run_marker_description": marker_description,
+            "n_run_marker_candidates": candidates,
+            "n_run_marker_rejected": len(rejected),
+            "rejected_run_markers": rejected,
+            "n_affected_time_samples": sum(r["n_samples"] for r in records),
+            "gap_duration_seconds": sum(r["n_samples"] for r in records) / sfreq,
+            "n_remaining_nonfinite_values": remaining,
+            "n_interpolated_values": n_nonfinite + sum(
+                data.shape[0] * (stop - start)
+                for start, stop, kind in intervals if kind == "run_gap"
             ),
-
-            "n_run_gaps": sum(
-                x["kind"] == "run_gap_32766"
-                for x in gap_records
-            ),
-
-            "n_run_marker_candidates": marker_candidates,
-            "n_run_marker_rejected": len(marker_rejected),
-            "rejected_run_markers": marker_rejected,
-
-            "n_affected_time_samples": int(
-                sum(x["n_samples"] for x in gap_records)
-            ),
-
-            "gap_duration_seconds": float(
-                sum(x["n_samples"] for x in gap_records) / sfreq
-            ),
-
-            "n_remaining_nonfinite_values": n_remaining_nonfinite,
-
-            "n_interpolated_values": (
-                n_nonfinite_values
-                + sum(
-                    data.shape[0] * (b - a)
-                    for a, b, kind in intervals
-                    if kind == "run_gap"
-                )
-            ),
-
             "n_bad_annotated_samples": int(guarded_mask.sum()),
-
-            "guard_seconds": float(guard),
-            "gaps": gap_records,
+            "guard_seconds": guard,
+            "gaps": records,
         }
-
-        if gap_records:
+        
+        if not marker_codes:
             warnings.warn(
-                f"{len(gap_records)} gap(s) detected and interpolated. "
-                "The corresponding guarded intervals were marked BAD."
+                f"No '{marker_description}' annotations found: no run separators were checked.",
+                stacklevel=2,
             )
-
+        
+        if records:
+            warnings.warn(
+                f"{len(records)} gap(s) interpolated and marked BAD.",
+                stacklevel=2,
+            )
+       
         return out
 
     def select_eeg_channels(
@@ -436,74 +253,44 @@ class BCI2bGDFPreprocessor:
         raw: mne.io.BaseRaw,
         eeg_names: Optional[Sequence[str]] = None,
     ) -> Tuple[mne.io.BaseRaw, List[str], List[str]]:
-        """
-            Select exactly three distinct EEG channels by name.
-
-            Normalized exact-name matching is preferred. If no exact
-            match exists, normalized suffix matching is attempted.
-
-            Missing or ambiguous matches raise a ValueError.
-            EOG channels cannot be selected as EEG inputs.
-
-            Returns
-            -------
-            eeg_raw : mne.io.BaseRaw
-                Copy containing the selected EEG channels.
-            selected : List[str]
-                Resolved EEG channel names.
-            eog_names : List[str]
-                Detected EOG channel names in the original recording.
-        """
-
+        """Return three named EEG signals, their names and auxiliary EOG names."""
+        
         if eeg_names is None:
             eeg_names = self.config.eeg_channel_names
-
+        
         available = list(raw.ch_names)
-        selected = []
+        selected: List[str] = []
+        
         for requested in eeg_names:
             key = self._normalise_name(requested)
-
+            
             if not key:
-                raise ValueError(
-                    f"Invalid EEG channel name: {requested!r}"
-                )
-
-            exact_matches = [
-                name
-                for name in available
-                if self._normalise_name(name) == key
+                raise ValueError(f"Invalid EEG channel name {requested!r}")
+            
+            exact = [n for n in available if self._normalise_name(n) == key]
+            matches = exact if exact else [
+                n for n in available if self._normalise_name(n).endswith(key)
             ]
-
-            if exact_matches:
-                matches = exact_matches
-            else:
-                matches = [
-                    name
-                    for name in available
-                    if self._normalise_name(name).endswith(key)
-                ]
-
+            
             if len(matches) != 1:
                 raise ValueError(
-                    f"Cannot uniquely resolve EEG channel {requested!r}. "
-                    f"Available channels: {available}"
+                    f"Cannot uniquely resolve EEG channel {requested!r}; "
+                    f"available: {available}"
                 )
             
             selected.append(matches[0])
-
+        
         if len(selected) != 3 or len(set(selected)) != 3:
-            raise ValueError(f"Expected exactly 3 distinct EEG channels, got {selected}")
-
-        eog_names = [
-            name for name in available
-            if re.search(self.config.eog_channel_pattern, name)
-        ]
+            raise ValueError(f"Expected exactly three distinct EEG channels, got {selected}")
+        
+        eog_names = [n for n in available if re.search(self.config.eog_channel_pattern, n)]
+        
         if set(selected) & set(eog_names):
-            raise ValueError("An EOG channel was selected as an EEG input.")
-
+            raise ValueError("An EOG channel was selected as an EEG input")
+        
         eeg_raw = raw.copy().pick(selected)
         eeg_raw.set_channel_types(
-            {name: "eeg" for name in selected},
-            on_unit_change="ignore",
+            {name: "eeg" for name in selected}, on_unit_change="ignore"
         )
+        
         return eeg_raw, selected, eog_names
