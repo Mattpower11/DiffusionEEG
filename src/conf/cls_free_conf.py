@@ -10,7 +10,7 @@ class cls_free_conf:
     channels: int = 3
     num_classes: int = 2
     sequence_length: int = 500
-    data_dir: str = "./datasets/processed_BCICIV_2b_gdf"
+    data_dir: str = "./../datasets/processed_BCICIV_2b_gdf"
 
     epochs: int = 100
     batch_size: int = 32

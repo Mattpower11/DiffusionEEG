@@ -2,6 +2,7 @@
 *.csv
 *.dat
 *.efx
+*.gdf
 *.gbr
 *.key
 *.pps
@@ -16,3 +17,4 @@
 datasets/
 __pycache__/
 runs/
+results/

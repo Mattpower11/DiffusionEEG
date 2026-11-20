@@ -1,6 +1,3 @@
-# copy from https://github.com/lucidrains/denoising-diffusion-pytorch/blob/main/denoising_diffusion_pytorch/classifier_free_guidance.py
-# TO DO: modify it to 1D classifier free guidance stable diffusion model 
-
 import math
 import copy
 from pathlib import Path
@@ -437,6 +434,12 @@ class Unet1D_cls_free(nn.Module):
     ):
         batch, device = x.shape[0], x.device
 
+        # Padding interno per lunghezze EEG non divisibili per 2**3 (500 -> 504).
+        original_length = x.shape[-1]
+        padding = (-original_length) % 8
+        if padding:
+            x = F.pad(x, (0, padding))
+
         cond_drop_prob = default(cond_drop_prob, self.cond_drop_prob)
 
         # derive condition, with condition dropout for classifier free guidance        
@@ -491,7 +494,8 @@ class Unet1D_cls_free(nn.Module):
         x = torch.cat((x, r), dim = 1)
 
         x = self.final_res_block(x, t, c)
-        return self.final_conv(x)
+        result = self.final_conv(x)
+        return result[..., :original_length]
 
 # gaussian diffusion trainer class
 
@@ -804,32 +808,32 @@ class GaussianDiffusion1D_cls_free(nn.Module):
 # example
 
 if __name__ == '__main__':
-    num_classes = 10
+    # Test dimostrativo indipendente dal training (ridotto per essere rapido).
+    device = torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')
+    num_classes = 2
 
     model = Unet1D_cls_free(
-        dim = 64,
-        dim_mults = (1, 2, 4, 8),
-        num_classes = num_classes,
-        cond_drop_prob = 0.5
+        dim=16,
+        dim_mults=(1, 2, 4, 8),
+        num_classes=num_classes,
+        cond_drop_prob=0.5,
+        channels=3
     )
 
     diffusion = GaussianDiffusion1D_cls_free(
         model,
-        seq_length = 128,
-        timesteps = 1000
-    ).cuda()
+        seq_length=500,
+        timesteps=10
+    ).to(device)
 
-    training_signals = torch.randn(8, 3, 128).cuda() # images are normalized from 0 to 1
-    signal_classes = torch.randint(0, num_classes, (8,)).cuda()    # say 10 classes
+    training_signals = torch.rand(2, 3, 500, device=device)
+    signal_classes = torch.randint(0, num_classes, (2,), device=device)
 
-    loss = diffusion(training_signals, classes = signal_classes)
+    loss = diffusion(training_signals, classes=signal_classes)
     loss.backward()
 
-    # do above for many steps
-
     sampled_signals = diffusion.sample(
-        classes = signal_classes,
-        cond_scale = 3.                # condition scaling, anything greater than 1 strengthens the classifier free guidance. reportedly 3-8 is good empirically
+        classes=signal_classes,
+        cond_scale=3.
     )
-
-    print(sampled_images.shape) # (8, 3, 128)
+    print(sampled_signals.shape)  # (2, 3, 500)

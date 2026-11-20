@@ -10,7 +10,7 @@ class sign_cond_conf:
     channels: int = 3
     num_classes: int = 2
     sequence_length: int = 500
-    data_dir: str = "./datasets/processed_BCICIV_2b_gdf"
+    data_dir: str = "./../datasets/processed_BCICIV_2b_gdf"
 
     max_iterations: int = 1_000_000
     batch_size: int = 32

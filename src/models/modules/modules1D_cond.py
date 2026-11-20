@@ -1,10 +1,3 @@
-# Copy from https://github.com/lucidrains/denoising-diffusion-pytorch/blob/main/denoising_diffusion_pytorch/denoising_diffusion_pytorch_1d.py
-
-#TO DO: build UNet1D_conditional
-# check classifier_free_guidance.py https://github.com/lucidrains/denoising-diffusion-pytorch/blob/main/denoising_diffusion_pytorch/classifier_free_guidance.py
-
-# modify it to 1D 
-
 import math
 from random import random
 from functools import partial
@@ -343,6 +336,14 @@ class Unet1D(nn.Module):
         self.final_conv = nn.Conv1d(dim, self.out_dim, 1)
 
     def forward(self, x, time, x_self_cond = None):
+        # Padding interno per lunghezze EEG non divisibili per 2**4 (500 -> 512).
+        original_length = x.shape[-1]
+        padding = (-original_length) % 16
+        if padding:
+            x = F.pad(x, (0, padding))
+            if x_self_cond is not None:
+                x_self_cond = F.pad(x_self_cond, (0, padding))
+
         if self.self_condition:
             x_self_cond = default(x_self_cond, lambda: torch.zeros_like(x))
             x = torch.cat((x_self_cond, x), dim = 1)
@@ -381,7 +382,8 @@ class Unet1D(nn.Module):
         x = torch.cat((x, r), dim = 1)
 
         x = self.final_res_block(x, t)
-        return self.final_conv(x)
+        result = self.final_conv(x)
+        return result[..., :original_length]
 
 # gaussian diffusion trainer class
 
