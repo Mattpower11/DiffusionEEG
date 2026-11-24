@@ -1,3 +1,7 @@
+"""Valutazione dei modelli BioDiffusion adattati a EEG BCI Competition IV 2b.
+
+Eseguire dalla cartella src: python -m test.test_eeg_dataset --model all
+"""
 from __future__ import annotations
 
 import argparse
@@ -192,7 +196,8 @@ def save_example_plot(real: torch.Tensor, generated: torch.Tensor,
 def evaluate_pair(model_name: str, class_id: int,
                   real: torch.Tensor, fake: torch.Tensor,
                   device: torch.device, seed: int, ds_epochs: int,
-                  skip_discriminative: bool) -> dict:
+                  skip_discriminative: bool,
+                  diagnostics_dir: Optional[Path] = None) -> dict:
     real_np = real.numpy().astype(np.float64, copy=False)
     fake_np = fake.numpy().astype(np.float64, copy=False)
     if fake.shape != real.shape:
@@ -205,6 +210,7 @@ def evaluate_pair(model_name: str, class_id: int,
         real, fake, device, seed=seed + class_id,
         epochs=ds_epochs, minimum_real_samples=10,
         bounded_split=True, model_seed=seed + class_id,
+        diagnostics_dir=diagnostics_dir,
     )
     return {
         "Model": model_name, "Class ID": class_id,
@@ -245,6 +251,20 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     p.add_argument("--cond-scale", type=float, default=None)
     p.add_argument("--snr-db", type=float, default=None)
     p.add_argument("--ds-epochs", type=int, default=None)
+    p.add_argument("--ds-diagnostics", action="store_true",
+                   help="Salva history.csv e summary.json delle prestazioni LSTM")
+    p.add_argument("--ds-only", action="store_true",
+                   help="Ricalcola solo il DS dai real.npy e generated.npy gia' esportati")
+    p.add_argument("--ds-positive-control", action="store_true",
+                   help="Controllo positivo: confronta real.npy con real.npy + offset (senza BioDiffusion)")
+    p.add_argument("--ds-positive-offset", type=float, default=5.0,
+                   help="Traslazione additiva deliberatamente evidente per il controllo positivo (default: 5.0)")
+    p.add_argument("--ds-sensitivity-control", action="store_true",
+                   help="Serie di controlli artificiali a offset crescenti e seed multipli; richiede --ds-only")
+    p.add_argument("--ds-sensitivity-offsets", type=str, default="0,0.25,0.5,1,2,5",
+                   help="Lista separata da virgole degli offset; lo zero e' controllo negativo")
+    p.add_argument("--ds-sensitivity-seeds", type=int, default=5,
+                   help="Numero di seed consecutivi per ogni intensita' (default: 5)")
     p.add_argument("--skip-discriminative", action="store_true",
                    help="Non addestrare la LSTM: Discriminative Score indicato come NaN")
     p.add_argument("--device", default=None)
@@ -264,6 +284,26 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     else:
         args.output_dir = args.output_dir.expanduser().resolve()
     args.data_dir = _resolve_source_path(config.data_dir) if args.data_dir is None else args.data_dir.expanduser().resolve()
+    if args.ds_only and args.skip_discriminative:
+        p.error("--ds-only non e compatibile con --skip-discriminative")
+    if args.ds_positive_control and not args.ds_only:
+        p.error("--ds-positive-control richiede --ds-only")
+    if args.ds_sensitivity_control and not args.ds_only:
+        p.error("--ds-sensitivity-control richiede --ds-only")
+    if args.ds_sensitivity_control and args.ds_positive_control:
+        p.error("--ds-sensitivity-control e --ds-positive-control non si possono combinare")
+    if args.ds_sensitivity_seeds < 1:
+        p.error("--ds-sensitivity-seeds deve essere >= 1")
+    try:
+        args.ds_sensitivity_offsets = tuple(float(v.strip()) for v in args.ds_sensitivity_offsets.split(","))
+    except ValueError:
+        p.error("--ds-sensitivity-offsets deve contenere numeri separati da virgola")
+    if not args.ds_sensitivity_offsets or any(not np.isfinite(v) or v < 0 for v in args.ds_sensitivity_offsets):
+        p.error("--ds-sensitivity-offsets: lista non vuota di valori finiti >= 0")
+    if len(set(args.ds_sensitivity_offsets)) != len(args.ds_sensitivity_offsets):
+        p.error("--ds-sensitivity-offsets: non ripetere lo stesso offset")
+    if args.ds_positive_control and (not np.isfinite(args.ds_positive_offset) or args.ds_positive_offset == 0):
+        p.error("--ds-positive-offset deve essere finito e diverso da zero")
     if args.samples_per_class < 0 or args.batch_size < 1 or args.ds_epochs < 1:
         p.error("--samples-per-class >= 0, --batch-size >= 1, --ds-epochs >= 1")
     if not np.isfinite(args.snr_db) or not np.isfinite(args.cond_scale):
@@ -318,7 +358,9 @@ def evaluate(args: argparse.Namespace) -> pd.DataFrame:
                 np.save(path / name, arr)
             save_example_plot(real, fake, path / "example.png")
             rows.append(evaluate_pair("cls_free", cid, real, fake, device,
-                                      args.seed, args.ds_epochs, args.skip_discriminative))
+                                      args.seed, args.ds_epochs, args.skip_discriminative,
+                                      (output_dir / "ds_diagnostics" / "cls_free" / CLASS_NAMES[cid])
+                                      if args.ds_diagnostics else None))
         del diffusion
 
     if args.model in ("sign_cond", "all"):
@@ -346,7 +388,9 @@ def evaluate(args: argparse.Namespace) -> pd.DataFrame:
                 np.save(path / name, arr)
             save_example_plot(real, fake, path / "example.png", condition, args.snr_db)
             rows.append(evaluate_pair("sign_cond", cid, real, fake, device,
-                                      args.seed, args.ds_epochs, args.skip_discriminative))
+                                      args.seed, args.ds_epochs, args.skip_discriminative,
+                                      (output_dir / "ds_diagnostics" / "sign_cond" / CLASS_NAMES[cid])
+                                      if args.ds_diagnostics else None))
             del diffusion
 
     results = add_aggregates(pd.DataFrame(rows))
@@ -368,14 +412,189 @@ def evaluate(args: argparse.Namespace) -> pd.DataFrame:
     return results
 
 
+def evaluate_ds_only(args: argparse.Namespace) -> pd.DataFrame:
+    """Ricalcola esclusivamente DS su campioni salvati, senza generazione/checkpoint."""
+    output_dir = args.output_dir
+    device = torch.device(args.device)
+    if device.type == "cuda" and not torch.cuda.is_available():
+        raise RuntimeError("CUDA richiesta ma non disponibile")
+    class_ids = [args.class_id] if args.class_id is not None else [0, 1]
+    model_names = [args.model] if args.model != "all" else ["cls_free", "sign_cond"]
+    rows = []
+    for model_name in model_names:
+        for class_id in class_ids:
+            folder = output_dir / model_name / CLASS_NAMES[class_id]
+            real_path, fake_path = folder / "real.npy", folder / "generated.npy"
+            if not real_path.is_file():
+                raise FileNotFoundError(f"EEG reali assenti: {real_path}")
+            real = torch.from_numpy(np.load(real_path, allow_pickle=False).astype(np.float32))
+            if args.ds_positive_control:
+                # Controllo diagnostico: dati volutamente separabili, non EEG sintetici
+                # BioDiffusion. L'offset e' applicato in memoria, senza sovrascrivere .npy.
+                fake = real + args.ds_positive_offset
+            else:
+                if not fake_path.is_file():
+                    raise FileNotFoundError(f"EEG sintetici assenti: {fake_path}")
+                fake = torch.from_numpy(np.load(fake_path, allow_pickle=False).astype(np.float32))
+            if real.shape != fake.shape or real.ndim != 3 or real.shape[1:] != (3, 500):
+                raise ValueError(f"Forme EEG non compatibili in {folder}: {real.shape}, {fake.shape}")
+            kind = "ds_positive_control" if args.ds_positive_control else "ds_diagnostics"
+            diagnostic_folder = output_dir / kind / model_name / CLASS_NAMES[class_id]
+            ds = Utility.discriminative_score(
+                real, fake, device, seed=args.seed + class_id,
+                epochs=args.ds_epochs, minimum_real_samples=10,
+                bounded_split=True, model_seed=args.seed + class_id,
+                diagnostics_dir=diagnostic_folder,
+            )
+            rows.append({"Model": model_name, "Class ID": class_id,
+                         "Class": CLASS_NAMES[class_id], "Samples": len(real),
+                         "Discriminative Score": ds})
+    results = add_aggregates_ds_only(pd.DataFrame(rows))
+    # Non sovrascrive metrics.csv e i segnali generati in precedenza.
+    result_name = "metrics_ds_positive_control.csv" if args.ds_positive_control else "metrics_ds_diagnostics.csv"
+    results.to_csv(output_dir / result_name, index=False)
+    return results
+
+
+
+def evaluate_ds_sensitivity(args: argparse.Namespace) -> pd.DataFrame:
+    """Controllo di sensibilita' sulla sola LSTM: fake = real + offset.
+
+    Riutilizza i file real.npy gia' salvati. Non usa i pesi BioDiffusion,
+    non crea file fake.npy e non modifica la definizione del Discriminative Score.
+    """
+    device = torch.device(args.device)
+    if device.type == "cuda" and not torch.cuda.is_available():
+        raise RuntimeError("CUDA richiesta ma non disponibile")
+
+    class_ids = [args.class_id] if args.class_id is not None else [0, 1]
+    model_names = [args.model] if args.model != "all" else ["cls_free", "sign_cond"]
+    rows = []
+    sensitivity_root = args.output_dir / "ds_sensitivity_control"
+    sensitivity_root.mkdir(parents=True, exist_ok=True)
+
+    for model_name in model_names:
+        for class_id in class_ids:
+            folder = args.output_dir / model_name / CLASS_NAMES[class_id]
+            real_path = folder / "real.npy"
+            if not real_path.is_file():
+                raise FileNotFoundError(f"EEG reali non trovati: {real_path}")
+            real = torch.from_numpy(np.load(real_path, allow_pickle=False).astype(np.float32))
+            if real.ndim != 3 or real.shape[1:] != (3, 500) or not torch.isfinite(real).all():
+                raise ValueError(f"Dati EEG non validi in {real_path}: {tuple(real.shape)}")
+            if len(real) < 10:
+                raise ValueError(f"Servono almeno 10 EEG reali per classe; in {real_path}: {len(real)}")
+
+            for offset in args.ds_sensitivity_offsets:
+                # Offset applicato in memoria, senza sovrascrivere generated.npy.
+                fake = real + offset
+                label = f"offset_{offset:g}".replace(".", "p")
+                for idx in range(args.ds_sensitivity_seeds):
+                    seed = args.seed + idx
+                    diagnostics_dir = sensitivity_root / model_name / CLASS_NAMES[class_id] / label / f"seed_{seed}"
+                    ds = Utility.discriminative_score(
+                        real, fake, device,
+                        seed=seed + class_id,
+                        epochs=args.ds_epochs,
+                        minimum_real_samples=10,
+                        bounded_split=True,
+                        model_seed=seed + class_id,
+                        diagnostics_dir=diagnostics_dir,
+                    )
+                    details_path = diagnostics_dir / "summary.json"
+                    details = json.loads(details_path.read_text(encoding="utf-8"))
+                    if details.get("status") != "ok":
+                        raise RuntimeError(f"DS non calcolabile per {diagnostics_dir}")
+                    rows.append({
+                        "Model": model_name,
+                        "Class ID": class_id,
+                        "Class": CLASS_NAMES[class_id],
+                        "Offset": offset,
+                        "Seed": seed,
+                        "Samples per origin": len(real),
+                        "Discriminative Score": ds,
+                        "Train Accuracy": details["train"]["accuracy"],
+                        "Test Accuracy": details["test"]["accuracy"],
+                        "Train Loss": details["train"]["loss"],
+                        "Test Loss": details["test"]["loss"],
+                        "Predicted Real Fraction": details["test"]["predicted_real_fraction"],
+                        "Probability Std": details["test"]["probability_std"],
+                        "Warnings": ";".join(details.get("warning_flags", [])),
+                    })
+
+    detail_df = pd.DataFrame(rows)
+    detail_df.to_csv(args.output_dir / "metrics_ds_sensitivity_control.csv", index=False)
+
+    summary = detail_df.groupby(["Model", "Class ID", "Class", "Offset"], sort=False).agg(
+        seeds=("Seed", "count"),
+        ds_mean=("Discriminative Score", "mean"),
+        ds_std=("Discriminative Score", "std"),
+        train_acc_mean=("Train Accuracy", "mean"),
+        test_acc_mean=("Test Accuracy", "mean"),
+        test_acc_std=("Test Accuracy", "std"),
+        test_loss_mean=("Test Loss", "mean"),
+    ).reset_index()
+    summary["ds_std"] = summary["ds_std"].fillna(0.0)
+    summary["test_acc_std"] = summary["test_acc_std"].fillna(0.0)
+    summary.to_csv(args.output_dir / "metrics_ds_sensitivity_summary.csv", index=False)
+
+    # Un grafico per modello per non sovrapporre popolazioni diverse.
+    for model_name in model_names:
+        fig, ax = plt.subplots(figsize=(8, 5))
+        model_summary = summary[summary["Model"] == model_name]
+        for class_id in class_ids:
+            cls = model_summary[model_summary["Class ID"] == class_id].sort_values("Offset")
+            ax.errorbar(cls["Offset"], cls["ds_mean"], yerr=cls["ds_std"],
+                        marker="o", capsize=3, label=CLASS_NAMES[class_id])
+        ax.set_xlabel("Offset artificiale applicato all'EEG")
+        ax.set_ylabel("Discriminative Score |test accuracy - 0.5|")
+        ax.set_ylim(-0.02, 0.52)
+        ax.set_title(f"Controllo di sensibilita' LSTM - {model_name}")
+        ax.grid(alpha=0.3)
+        ax.legend()
+        fig.tight_layout()
+        fig.savefig(sensitivity_root / f"sensitivity_{model_name}.png", dpi=140)
+        plt.close(fig)
+
+    metadata = {
+        "description": "Controllo artificiale di sensibilita' del Discriminative Score (fake=real+offset)",
+        "offsets": list(args.ds_sensitivity_offsets),
+        "seeds": [args.seed + i for i in range(args.ds_sensitivity_seeds)],
+        "epochs": args.ds_epochs,
+        "metric": "abs(test_accuracy - 0.5)",
+        "note": "Il controllo dimostra sensibilita' a offset costanti, non stabilisce la qualita' degli EEG generati.",
+    }
+    (sensitivity_root / "evaluation.json").write_text(json.dumps(metadata, indent=2, ensure_ascii=False), encoding="utf-8")
+    return summary
+
+
+def add_aggregates_ds_only(frame: pd.DataFrame) -> pd.DataFrame:
+    aggregate = []
+    for name, group in frame.groupby("Model", sort=False):
+        aggregate.append({"Model": name, "Class ID": "-", "Class": "Aggregated (Mean)",
+                          "Samples": int(group["Samples"].sum()),
+                          "Discriminative Score": float(group["Discriminative Score"].mean(skipna=True))})
+    return pd.concat([frame, pd.DataFrame(aggregate)], ignore_index=True)
+
+
 def main(argv: Optional[Sequence[str]] = None) -> int:
     args = parse_args(argv)
     try:
-        results = evaluate(args)
+        if args.ds_sensitivity_control:
+            results = evaluate_ds_sensitivity(args)
+        else:
+            results = evaluate_ds_only(args) if args.ds_only else evaluate(args)
     except (FileNotFoundError, ValueError, RuntimeError, ImportError, OSError) as exc:
         print(f"Errore durante il test: {exc}", file=sys.stderr)
         return 1
-    print("\nRisultati (Wavelet Coherence più alta; Discriminative Score più vicino a zero):")
+    if args.ds_sensitivity_control:
+        print("\nCONTROLLO DI SENSIBILITA': DS medio e deviazione standard per offset:")
+    elif args.ds_positive_control:
+        print("\nCONTROLLO POSITIVO: segnali deliberatamente separabili; DS atteso vicino a 0.5:")
+    elif args.ds_only:
+        print("\nRisultati ricalcolati (Discriminative Score; più vicino a zero):")
+    else:
+        print("\nRisultati (Wavelet Coherence più alta; Discriminative Score più vicino a zero):")
     print(results.to_string(index=False, float_format=lambda x: f"{x:.4f}"))
     print(f"\nRisultati salvati in: {args.output_dir}")
     return 0

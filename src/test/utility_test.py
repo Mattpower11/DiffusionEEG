@@ -1,4 +1,6 @@
 from pathlib import Path
+import csv
+import json
 from typing import Optional
 
 import numpy as np
@@ -133,28 +135,36 @@ class Utility:
         minimum_real_samples: Optional[int] = None,
         bounded_split: bool = False,
         model_seed: Optional[int] = None,
+        diagnostics_dir: Optional[Path] = None,
     ) -> float:
-        if minimum_real_samples is not None and len(real) < minimum_real_samples:
-            return float("nan")
+        """Score originale |test_accuracy - 0.5| con diagnostiche opzionali.
 
-        # Il classificatore richiede esempi sufficienti di entrambe le origini.
-        # Due campioni per origine (come nello smoke test) non producono
-        # una stima statisticamente utile del Discriminative Score.
+        L'accoppiamento real[i] / fake[i] preserva lo split senza leakage per
+        il Signal-conditional. Nel Label-conditional e' soltanto stratificazione.
+        """
         if len(real) != len(fake):
             raise ValueError("Discriminative Score requires equal real/fake sample counts.")
-        if len(real) < 10:
-            return float("nan")
         if real.ndim != 3 or fake.shape != real.shape:
             raise ValueError("Expected matching EEG tensors shaped (B, C, T).")
+        if not torch.isfinite(real).all() or not torch.isfinite(fake).all():
+            raise ValueError("Discriminative Score inputs contain non-finite values")
+        diagnostics_dir = Path(diagnostics_dir) if diagnostics_dir is not None else None
+        if diagnostics_dir is not None:
+            diagnostics_dir.mkdir(parents=True, exist_ok=True)
+        min_samples = max(10, minimum_real_samples or 0)
+        if len(real) < min_samples:
+            if diagnostics_dir is not None:
+                (diagnostics_dir / "summary.json").write_text(json.dumps({
+                    "status": "insufficient_samples", "samples_per_origin": len(real),
+                    "minimum_samples_per_origin": min_samples,
+                    "discriminative_score": None
+                }, indent=2), encoding="utf-8")
+            return float("nan")
 
         features = torch.cat([real, fake], dim=0)
-        targets = torch.cat(
-            [torch.ones(len(real)), torch.zeros(len(fake))], dim=0
-        )
+        targets = torch.cat([torch.ones(len(real)), torch.zeros(len(fake))], dim=0)
 
-        # Split stratificato e per coppie: l'EEG originale e la sua eventuale
-        # ricostruzione rimangono nello stesso sottoinsieme (evita leakage).
-        # Funziona anche per il class-free, dove l'accoppiamento e' arbitrario.
+        # Split bilanciato, per coppie: mai originale e ricostruzione in gruppi diversi.
         n = len(real)
         indices = torch.randperm(n, generator=torch.Generator().manual_seed(seed))
         split = max(1, min(n - 1, int(0.7 * n)))
@@ -172,8 +182,41 @@ class Utility:
         model = LSTMClassifier(input_size=real.shape[1]).to(device)
         optimizer = torch.optim.Adam(model.parameters(), lr=0.001)
         criterion = nn.BCEWithLogitsLoss()
+
+        def evaluate_split(indices_for_split: torch.Tensor) -> dict:
+            """Valutazione senza backprop, in batch, solo per diagnostica."""
+            model.eval()
+            logits_list = []
+            with torch.no_grad():
+                for start in range(0, len(indices_for_split), 32):
+                    ix = indices_for_split[start:start + 32]
+                    logits_list.append(model(features[ix].to(device)).cpu().flatten())
+            logits = torch.cat(logits_list)
+            y = targets[indices_for_split].cpu().flatten()
+            p = torch.sigmoid(logits)
+            predicted = (p >= 0.5).to(y.dtype)
+            tp = int(((predicted == 1) & (y == 1)).sum().item())
+            tn = int(((predicted == 0) & (y == 0)).sum().item())
+            fp = int(((predicted == 1) & (y == 0)).sum().item())
+            fn = int(((predicted == 0) & (y == 1)).sum().item())
+            recall_real = tp / (tp + fn) if tp + fn else float('nan')
+            recall_fake = tn / (tn + fp) if tn + fp else float('nan')
+            return {
+                "loss": float(criterion(logits, y).item()),
+                "accuracy": float((predicted == y).float().mean().item()),
+                "balanced_accuracy": float((recall_real + recall_fake) / 2),
+                "predicted_real_fraction": float(predicted.float().mean().item()),
+                "prob_real_mean": float(p[y == 1].mean().item()),
+                "prob_fake_mean": float(p[y == 0].mean().item()),
+                "probability_std": float(p.std(unbiased=False).item()),
+                "confusion_matrix": {"tn": tn, "fp": fp, "fn": fn, "tp": tp},
+                "n_real": int((y == 1).sum().item()),
+                "n_fake": int((y == 0).sum().item()),
+            }
+
+        history = []
         model.train()
-        for _ in range(epochs):
+        for epoch in range(epochs):
             for x_batch, y_batch in train_loader:
                 x_batch = x_batch.to(device)
                 y_batch = y_batch.to(device).unsqueeze(1)
@@ -181,14 +224,85 @@ class Utility:
                 loss = criterion(model(x_batch), y_batch)
                 loss.backward()
                 optimizer.step()
+            if diagnostics_dir is not None:
+                train_stats = evaluate_split(train_idx)
+                test_stats = evaluate_split(test_idx)
+                history.append({
+                    "epoch": epoch + 1,
+                    "train_loss": train_stats["loss"],
+                    "test_loss": test_stats["loss"],
+                    "train_accuracy": train_stats["accuracy"],
+                    "test_accuracy": test_stats["accuracy"],
+                    "train_balanced_accuracy": train_stats["balanced_accuracy"],
+                    "test_balanced_accuracy": test_stats["balanced_accuracy"],
+                    "train_predicted_real_fraction": train_stats["predicted_real_fraction"],
+                    "test_predicted_real_fraction": test_stats["predicted_real_fraction"],
+                })
+                model.train()
 
+        # La metrica rimane DEFINITA come nel programma originale: |accuracy - 0.5|.
         model.eval()
         with torch.no_grad():
             x_test = features[test_idx].to(device)
             y_test = targets[test_idx].to(device).unsqueeze(1)
             predictions = torch.sigmoid(model(x_test)) >= 0.5
             accuracy = (predictions == y_test).float().mean().item()
-        return float(abs(accuracy - 0.5))
+        score = float(abs(accuracy - 0.5))
+
+        if diagnostics_dir is not None:
+            train_stats = evaluate_split(train_idx)
+            test_stats = evaluate_split(test_idx)
+            warning_flags = []
+            if train_stats["predicted_real_fraction"] in (0.0, 1.0):
+                warning_flags.append("LSTM_predicts_only_one_class_on_training")
+            if test_stats["predicted_real_fraction"] in (0.0, 1.0):
+                warning_flags.append("LSTM_predicts_only_one_class_on_test")
+            if train_stats["accuracy"] <= 0.55:
+                warning_flags.append("train_accuracy_near_chance_or_worse")
+            if train_stats["probability_std"] < 0.02:
+                warning_flags.append("nearly_constant_predicted_probabilities")
+
+            summary = {
+                "status": "ok", "score_definition": "abs(test_accuracy - 0.5)",
+                "discriminative_score": score, "seed": seed,
+                "model_seed": model_seed, "epochs": epochs,
+                "samples_per_origin": n,
+                "train": train_stats, "test": test_stats,
+                "warning_flags": warning_flags,
+                "note": ("Flags are diagnostics, not proof of generator quality. "
+                         "Near-chance accuracy could indicate a good generator or an "
+                         "ineffective discriminator; use a separable-data positive control."),
+            }
+            with (diagnostics_dir / "history.csv").open("w", newline="", encoding="utf-8") as f:
+                writer = csv.DictWriter(f, fieldnames=history[0].keys())
+                writer.writeheader()
+                writer.writerows(history)
+            (diagnostics_dir / "summary.json").write_text(
+                json.dumps(summary, indent=2, ensure_ascii=False), encoding="utf-8"
+            )
+            # Grafici diagnostici, senza modificare il classificatore o la metrica.
+            import matplotlib.pyplot as plt
+            for quantity, label in (("loss", "BCE loss"), ("accuracy", "Accuracy")):
+                fig, ax = plt.subplots(figsize=(7, 4))
+                ax.plot([row["epoch"] for row in history],
+                        [row[f"train_{quantity}"] for row in history], label="Train")
+                ax.plot([row["epoch"] for row in history],
+                        [row[f"test_{quantity}"] for row in history], label="Test")
+                if quantity == "accuracy":
+                    ax.axhline(0.5, color="gray", linestyle="--", linewidth=1, label="Chance")
+                    ax.set_ylim(0, 1)
+                ax.set_xlabel("Epoch")
+                ax.set_ylabel(label)
+                ax.set_title(f"Discriminative Score - {label}")
+                ax.legend()
+                fig.tight_layout()
+                fig.savefig(diagnostics_dir / f"{quantity}.png", dpi=130)
+                plt.close(fig)
+            print(f"[DS] {diagnostics_dir}: test_acc={accuracy:.3f}, DS={score:.3f}, "
+                  f"train_acc={train_stats['accuracy']:.3f}, "
+                  f"predicted_real_fraction={test_stats['predicted_real_fraction']:.2f}, "
+                  f"flags={warning_flags or 'none'}")
+        return score
 
     @staticmethod
     def load_checkpoint(
