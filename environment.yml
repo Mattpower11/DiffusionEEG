@@ -18,6 +18,7 @@ dependencies:
   - matplotlib
   - tqdm
   - scipy
+  - pandas
   - pip
   - pip:
       - mne==1.10.2

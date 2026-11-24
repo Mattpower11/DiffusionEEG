@@ -21,3 +21,11 @@ class sign_cond_conf:
     )
     learning_rate: float = 1e-4
     snr_db: int = 20
+
+    test_samples_per_class: int = 16
+    test_batch_size: int = 4
+    test_sampling_timesteps: int = 2000
+    test_ds_epochs: int = 30
+    test_seed: int = 42
+    test_results_dir: str = "./results/eeg_test"
+    test_snr_db: float = 20.0
