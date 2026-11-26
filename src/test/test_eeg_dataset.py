@@ -157,7 +157,7 @@ def generate_cls_free(diffusion, labels: torch.Tensor, device: torch.device,
         # Nella versione consegnata, sample() applica unnormalize_to_zero_to_one
         # anche se il training riceveva direttamente i segnali EEG standardizzati.
         # Riporta l'output alla scala grezza prodotta dalla diffusione (non clip).
-        generated.append((part * 2.0 - 1.0).cpu())
+        generated.append(part.cpu())
     return torch.cat(generated, dim=0)
 
 
@@ -253,6 +253,8 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     p.add_argument("--ds-epochs", type=int, default=None)
     p.add_argument("--ds-diagnostics", action="store_true",
                    help="Salva history.csv e summary.json delle prestazioni LSTM")
+    p.add_argument("--cls-free-clip-study", action="store_true",
+                   help="Confronta output corrente, conversione corretta e sampling senza clipping, usando lo stesso checkpoint")
     p.add_argument("--ds-only", action="store_true",
                    help="Ricalcola solo il DS dai real.npy e generated.npy gia' esportati")
     p.add_argument("--ds-positive-control", action="store_true",
@@ -284,6 +286,10 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     else:
         args.output_dir = args.output_dir.expanduser().resolve()
     args.data_dir = _resolve_source_path(config.data_dir) if args.data_dir is None else args.data_dir.expanduser().resolve()
+    if args.cls_free_clip_study and args.model != "cls_free":
+        p.error("--cls-free-clip-study richiede --model cls_free")
+    if args.cls_free_clip_study and args.ds_only:
+        p.error("--cls-free-clip-study non si combina con --ds-only")
     if args.ds_only and args.skip_discriminative:
         p.error("--ds-only non e compatibile con --skip-discriminative")
     if args.ds_positive_control and not args.ds_only:
@@ -410,6 +416,174 @@ def evaluate(args: argparse.Namespace) -> pd.DataFrame:
     }
     (output_dir / "evaluation.json").write_text(json.dumps(metadata, indent=2, ensure_ascii=False), encoding="utf-8")
     return results
+
+
+
+
+@torch.inference_mode()
+def _generate_cls_free_no_clip(diffusion, labels: torch.Tensor,
+                               device: torch.device, batch_size: int,
+                               cond_scale: float) -> torch.Tensor:
+    """Stesso checkpoint; disattiva SOLO il clipping di x_start durante il sampling.
+
+    La classe GaussianDiffusion1D_cls_free espone clip_denoised nei metodi
+    ddim_sample e p_sample, ma non nel metodo sample pubblico. Questa funzione
+    usa quei metodi direttamente, senza alterare modules1D_cls_free.py.
+    Restituisce output nella scala del dataset, come sample() del repository.
+    """
+    out = []
+    channels, length = diffusion.channels, diffusion.seq_length
+    for offset in range(0, len(labels), batch_size):
+        lab = labels[offset:offset + batch_size].to(device)
+        shape = (len(lab), channels, length)
+        if diffusion.is_ddim_sampling:
+            part = diffusion.ddim_sample(lab, shape, cond_scale=cond_scale,
+                                         clip_denoised=False)
+        else:
+            img = torch.randn(shape, device=device)
+            # Riproduce p_sample_loop, ma inoltra clip_denoised=False
+            for t in reversed(range(diffusion.num_timesteps)):
+                img, _ = diffusion.p_sample(img, t, lab, cond_scale=cond_scale,
+                                           clip_denoised=False)
+            part = (img + 1.0) * 0.5
+        out.append(part.cpu())
+    return torch.cat(out, dim=0)
+
+
+def _clip_study_stats(data: np.ndarray, variant: str, cls: str,
+                      channel_name: str = "all") -> dict:
+    values = data.astype(np.float64, copy=False).ravel()
+    finite = np.isfinite(values)
+    result = {"variant": variant, "class": cls, "channel": channel_name,
+              "values": len(values), "finite_fraction": float(finite.mean())}
+    if not finite.all():
+        result.update({"min": np.nan, "max": np.nan, "mean": np.nan,
+                       "std": np.nan, "p01": np.nan, "p50": np.nan, "p99": np.nan,
+                       "outside_minus1_plus1": np.nan,
+                       "outside_0_1": np.nan,
+                       "at_bound_minus1": np.nan, "at_bound_plus1": np.nan})
+        return result
+    result.update({
+        "min": float(values.min()), "max": float(values.max()),
+        "mean": float(values.mean()), "std": float(values.std()),
+        "p01": float(np.percentile(values, 1)),
+        "p50": float(np.percentile(values, 50)),
+        "p99": float(np.percentile(values, 99)),
+        "outside_minus1_plus1": float(np.mean((values < -1) | (values > 1))),
+        "outside_0_1": float(np.mean((values < 0) | (values > 1))),
+        "at_bound_minus1": float(np.mean(values == -1)),
+        "at_bound_plus1": float(np.mean(values == 1)),
+    })
+    return result
+
+
+def evaluate_cls_free_clip_study(args: argparse.Namespace) -> pd.DataFrame:
+    """Diagnostica della scala: NON modifica i risultati della valutazione standard."""
+    device = torch.device(args.device)
+    if device.type == "cuda" and not torch.cuda.is_available():
+        raise RuntimeError("CUDA richiesta ma non disponibile")
+    real_all, labels_all = load_eeg_test_set(
+        args.data_dir, CLS_CFG.channels, CLS_CFG.sequence_length, CLS_CFG.num_classes)
+    checkpoint = find_class_free_checkpoint(args.class_free_checkpoint)
+    steps = args.sampling_timesteps or CLS_CFG.test_sampling_timesteps
+    if not 1 <= steps <= CLS_DIFFUSION_STEPS:
+        raise ValueError("Numero di passi non valido")
+    model = build_cls_free(device, checkpoint, steps)
+    out_root = args.output_dir / "cls_free_clip_study"
+    out_root.mkdir(parents=True, exist_ok=True)
+    rows = []
+    for cid in ([args.class_id] if args.class_id is not None else [0, 1]):
+        cls_name = CLASS_NAMES[cid]
+        real, labels, indices = select_class_samples(
+            real_all, labels_all, cid, args.samples_per_class, args.seed)
+        dest = out_root / cls_name
+        dest.mkdir(exist_ok=True)
+
+        # La stessa sequenza RNG genera il rumore iniziale nei due sampler.
+        shared_seed = args.seed + 100 + cid
+        torch.manual_seed(shared_seed)
+        if device.type == "cuda": torch.cuda.manual_seed_all(shared_seed)
+        sample_parts = []
+        for i in range(0, len(labels), args.batch_size):
+            lab = labels[i:i + args.batch_size].to(device)
+            sample_parts.append(model.sample(classes=lab, cond_scale=args.cond_scale).cpu())
+        corrected = torch.cat(sample_parts, dim=0)
+        # La condizione corrente del programma precedente: confronta in modo
+        # improprio la scala interna della diffusione con gli EEG standardizzati.
+        current = corrected * 2.0 - 1.0
+
+        torch.manual_seed(shared_seed)
+        if device.type == "cuda": torch.cuda.manual_seed_all(shared_seed)
+        without_clip = _generate_cls_free_no_clip(
+            model, labels, device, args.batch_size, args.cond_scale)
+
+        variants = {
+            "real": real.numpy(),
+            "current_legacy": current.numpy(),
+            "corrected_conversion_clip_on": corrected.numpy(),
+            "corrected_conversion_clip_off": without_clip.numpy(),
+        }
+        np.save(dest / "test_indices.npy", indices)
+        np.save(dest / "labels.npy", labels.numpy())
+        for name, array in variants.items():
+            np.save(dest / f"{name}.npy", array)
+            rows.append(_clip_study_stats(array, name, cls_name))
+            for ch, label in enumerate(("C3", "Cz", "C4")):
+                rows.append(_clip_study_stats(array[:, ch], name, cls_name, label))
+
+        # Stesse scale per tutti i tracciati; niente riscalatura di ampiezza.
+        fig, axs = plt.subplots(3, 1, figsize=(11, 8), sharex=True)
+        for ch, label in enumerate(("C3", "Cz", "C4")):
+            for name, arr in variants.items():
+                axs[ch].plot(arr[0, ch], label=name, linewidth=0.8, alpha=0.8)
+            axs[ch].set_ylabel(f"{label} (Z-score)")
+            axs[ch].grid(alpha=0.2)
+        axs[0].legend(ncol=2, fontsize=8)
+        axs[-1].set_xlabel("Campione temporale")
+        fig.tight_layout()
+        fig.savefig(dest / "waveforms.png", dpi=150)
+        plt.close(fig)
+
+        fig, ax = plt.subplots(figsize=(9, 5))
+        for name, arr in variants.items():
+            finite_vals = arr[np.isfinite(arr)]
+            if len(finite_vals):
+                ax.hist(finite_vals, bins=100, range=(-4, 4), density=True,
+                        histtype="step", linewidth=1.6, label=name)
+        ax.set_xlabel("Ampiezza normalizzata EEG (Z-score)")
+        ax.set_ylabel("Densità (visualizzazione limitata a [-4,4])")
+        ax.legend(fontsize=8)
+        fig.tight_layout()
+        fig.savefig(dest / "amplitude_histogram.png", dpi=150)
+        plt.close(fig)
+
+        if not torch.isfinite(without_clip).all():
+            print(f"AVVISO: il sampling senza clipping produce NaN/Inf per {cls_name}.")
+        else:
+            print(f"{cls_name}: senza clipping intervallo "
+                  f"[{without_clip.min().item():.4g}, {without_clip.max().item():.4g}]")
+
+    summary = pd.DataFrame(rows)
+    summary.to_csv(out_root / "amplitude_stats.csv", index=False)
+    (out_root / "experiment.json").write_text(json.dumps({
+        "purpose": "confronto controllato clipping e conversione in Label-conditional",
+        "checkpoint": str(checkpoint),
+        "sampling": "DDIM" if steps < CLS_DIFFUSION_STEPS else "DDPM",
+        "sampling_timesteps": steps, "cond_scale": args.cond_scale,
+        "samples_per_class_requested": args.samples_per_class,
+        "batch_size": args.batch_size, "seed": args.seed,
+        "initial_noise_seed_per_class": {CLASS_NAMES[c]: args.seed + 100 + c
+                                         for c in ([args.class_id] if args.class_id is not None else [0, 1])},
+        "warning": "La variante clip-off e diagnostica, NON una correzione convalidata. "
+                   "Il confronto non riaddestra il modello e non prova la qualita' dei segnali.",
+        "variants": {
+            "real": "EEG di test standardizzato (Z-score)",
+            "current_legacy": "sample() * 2 - 1: scala interna della diffusione",
+            "corrected_conversion_clip_on": "sample(): scala del dataset; clipping attivo",
+            "corrected_conversion_clip_off": "sample senza clipping: scala del dataset",
+        }
+    }, ensure_ascii=False, indent=2), encoding="utf-8")
+    return summary[summary["channel"] == "all"].copy()
 
 
 def evaluate_ds_only(args: argparse.Namespace) -> pd.DataFrame:
@@ -580,14 +754,18 @@ def add_aggregates_ds_only(frame: pd.DataFrame) -> pd.DataFrame:
 def main(argv: Optional[Sequence[str]] = None) -> int:
     args = parse_args(argv)
     try:
-        if args.ds_sensitivity_control:
+        if args.cls_free_clip_study:
+            results = evaluate_cls_free_clip_study(args)
+        elif args.ds_sensitivity_control:
             results = evaluate_ds_sensitivity(args)
         else:
             results = evaluate_ds_only(args) if args.ds_only else evaluate(args)
     except (FileNotFoundError, ValueError, RuntimeError, ImportError, OSError) as exc:
         print(f"Errore durante il test: {exc}", file=sys.stderr)
         return 1
-    if args.ds_sensitivity_control:
+    if args.cls_free_clip_study:
+        print("\nSTUDIO LABEL-CONDITIONAL: statistiche di ampiezza (frazione, non percentuale):")
+    elif args.ds_sensitivity_control:
         print("\nCONTROLLO DI SENSIBILITA': DS medio e deviazione standard per offset:")
     elif args.ds_positive_control:
         print("\nCONTROLLO POSITIVO: segnali deliberatamente separabili; DS atteso vicino a 0.5:")

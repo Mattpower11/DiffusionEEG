@@ -662,7 +662,7 @@ class GaussianDiffusion1D_cls_free(nn.Module):
 
         return ModelPrediction(pred_noise, x_start)
 
-    def p_mean_variance(self, x, t, classes, cond_scale, clip_denoised = True):
+    def p_mean_variance(self, x, t, classes, cond_scale, clip_denoised = False):
         preds = self.model_predictions(x, t, classes, cond_scale)
         x_start = preds.pred_x_start
 
@@ -673,7 +673,7 @@ class GaussianDiffusion1D_cls_free(nn.Module):
         return model_mean, posterior_variance, posterior_log_variance, x_start
 
     @torch.no_grad()
-    def p_sample(self, x, t: int, classes, cond_scale = 3., clip_denoised = True):
+    def p_sample(self, x, t: int, classes, cond_scale = 3., clip_denoised = False):
         b, *_, device = *x.shape, x.device
         batched_times = torch.full((x.shape[0],), t, device = x.device, dtype = torch.long)
         model_mean, _, model_log_variance, x_start = self.p_mean_variance(x = x, t = batched_times, classes = classes, cond_scale = cond_scale, clip_denoised = clip_denoised)
@@ -690,13 +690,13 @@ class GaussianDiffusion1D_cls_free(nn.Module):
         x_start = None
 
         for t in tqdm(reversed(range(0, self.num_timesteps)), desc = 'sampling loop time step', total = self.num_timesteps):
-            img, x_start = self.p_sample(img, t, classes, cond_scale)
+            img, x_start = self.p_sample(img, t, classes, cond_scale, clip_denoised = False)
 
-        img = unnormalize_to_zero_to_one(img)
+        # Output direttamente nella stessa scala Z-score usata nel training.
         return img
 
     @torch.no_grad()
-    def ddim_sample(self, classes, shape, cond_scale = 3., clip_denoised = True):
+    def ddim_sample(self, classes, shape, cond_scale = 3., clip_denoised = False):
         batch, device, total_timesteps, sampling_timesteps, eta, objective = shape[0], self.betas.device, self.num_timesteps, self.sampling_timesteps, self.ddim_sampling_eta, self.objective
 
         times = torch.linspace(-1, total_timesteps - 1, steps=sampling_timesteps + 1)   # [-1, 0, 1, 2, ..., T-1] when sampling_timesteps == total_timesteps
@@ -727,7 +727,7 @@ class GaussianDiffusion1D_cls_free(nn.Module):
                   c * pred_noise + \
                   sigma * noise
 
-        img = unnormalize_to_zero_to_one(img)
+        # Output direttamente nella stessa scala Z-score usata nel training.
         return img
 
     @torch.no_grad()
@@ -802,7 +802,7 @@ class GaussianDiffusion1D_cls_free(nn.Module):
         assert n == seq_length , f'seq length must be {seq_length}'
         t = torch.randint(0, self.num_timesteps, (b,), device=device).long()
 
-        img = normalize_to_neg_one_to_one(img)
+        # EEG gia' standardizzati (Z-score): nessuna trasformazione aggiuntiva.
         return self.p_losses(img, t, *args, **kwargs)
 
 # example
@@ -826,7 +826,7 @@ if __name__ == '__main__':
         timesteps=10
     ).to(device)
 
-    training_signals = torch.rand(2, 3, 500, device=device)
+    training_signals = torch.randn(2, 3, 500, device=device)
     signal_classes = torch.randint(0, num_classes, (2,), device=device)
 
     loss = diffusion(training_signals, classes=signal_classes)
